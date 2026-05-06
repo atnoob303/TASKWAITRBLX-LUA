@@ -1,0 +1,4544 @@
+-- ╔══════════════════════════════════════════════════════════════╗
+-- ║            ServerDataManager  —  ModuleScript                ║
+-- ║  Đặt trong: ServerScriptService                              ║
+-- ║  Yêu cầu:   DataManager đã chạy trước                        ║
+-- ╠══════════════════════════════════════════════════════════════╣
+-- ║  Hệ thống:                                                   ║
+-- ║   1. SessionData      — data phiên server                    ║
+-- ║   2. LiveData         — cross-server TTL                     ║
+-- ║   3. GlobalData       — toàn server vĩnh viễn                ║
+-- ║   4. ConflictResolver — xử lý xung đột khi đổi server        ║
+-- ║   5. ScheduledData    — data tự bật theo lịch                ║
+-- ║   6. RandomData       — random có trọng số/seed/bonus        ║
+-- ║   7. GameEventLog     — lưu sự kiện & session player         ║
+-- ║   8. DataConfig       — đọc config từ Folder trong Studio    ║
+-- ║   9. PlayerData       — load/save/migrate data player        ║
+-- ║      ├─ 3 hình thức key: Seed / Name / Id                    ║
+-- ║      ├─ OldData migration (attribute tên data cũ)            ║
+-- ║      ├─ Audit log / version history                          ║
+-- ║      ├─ Folder scan: tìm "DataStore" (case-insensitive)      ║
+-- ║      └─ Value objects làm schema định nghĩa data player      ║
+-- ╚══════════════════════════════════════════════════════════════╝
+
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local MessagingService   = game:GetService("MessagingService")
+local DataStoreService   = game:GetService("DataStoreService")
+local Players            = game:GetService("Players")
+local ServerStorage      = game:GetService("ServerStorage")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+-- ════════════════════════════════════════════
+--  MODULE CON — TÌM CASE-INSENSITIVE
+--  DataModule & DataSave nằm trong script này
+-- ════════════════════════════════════════════
+
+local function _requireChild(name)
+	local nameLower = name:lower()
+	for _, child in ipairs(script:GetChildren()) do
+		if child:IsA("ModuleScript") and child.Name:lower() == nameLower then
+			local ok, mod = pcall(require, child)
+			if ok then
+				print(string.format("[Data6] Đã require module con '%s' (tìm thấy: '%s')", name, child.Name))
+				return mod
+			else
+				warn(string.format("[Data6] require '%s' thất bại: %s", child.Name, tostring(mod)))
+				return nil
+			end
+		end
+	end
+	warn(string.format("[Data6] Không tìm thấy ModuleScript tên '%s' trong script", name))
+	return nil
+end
+
+local DataModule = _requireChild("DataModule")   -- quản lý data container server (shop, event, config…)
+local DataSave   = _requireChild("DataSave")     -- quản lý load/save data player theo session
+
+-- ════════════════════════════════════════════
+--              SERVICES & STORES
+-- ════════════════════════════════════════════
+
+local MemoryLive      = MemoryStoreService:GetSortedMap("LiveData")
+local MemoryGlobal    = MemoryStoreService:GetSortedMap("GlobalData")
+local MemorySession   = MemoryStoreService:GetSortedMap("SessionRegistry")
+local MemoryScheduled = MemoryStoreService:GetSortedMap("ScheduledData")
+
+local EventLogStore   = DataStoreService:GetDataStore("ServerEventLog_v1")
+local GlobalStore     = DataStoreService:GetDataStore("GlobalPersist_v1")
+local ScheduledStore  = DataStoreService:GetDataStore("ScheduledData_v1")
+local GameEventStore  = DataStoreService:GetDataStore("GameEventLog_v1")
+local PlayerSnapStore = DataStoreService:GetDataStore("PlayerSnapshot_v1")
+local AuditLogStore   = DataStoreService:GetDataStore("PlayerAuditLog_v1")
+
+local SERVER_ID    = game.JobId ~= "" and game.JobId or "STUDIO_" .. tostring(math.random(10000))
+local SERVER_START = os.time()
+local SERVER_PLACE = tostring(game.PlaceId)
+
+-- ════════════════════════════════════════════
+--              REMOTES
+-- ════════════════════════════════════════════
+
+-- Tìm hoặc tạo GameSettingUp/Sever trong ReplicatedStorage
+local GameSettingUp = ReplicatedStorage:FindFirstChild("GameSettingUp")
+	or Instance.new("Folder", ReplicatedStorage)
+GameSettingUp.Name = "GameSettingUp"
+
+local Remotes = GameSettingUp:FindFirstChild("Sever")
+	or Instance.new("Folder", GameSettingUp)
+Remotes.Name = "Sever"
+
+local function makeRemote(name, isFunc)
+	local expectedClass = isFunc and "RemoteFunction" or "RemoteEvent"
+	local r = Remotes:FindFirstChild(name)
+	if r then
+		if r.ClassName ~= expectedClass then
+			warn(string.format(
+				"[ServerDataManager] Remote '%s' sai type (%s, cần %s) — xóa và tạo lại",
+				name, r.ClassName, expectedClass
+				))
+			r:Destroy()
+		else
+			return r
+		end
+	end
+	r = Instance.new(expectedClass)
+	r.Name = name
+	r.Parent = Remotes
+	return r
+end
+
+local RF_GetGlobal      = makeRemote("GetGlobal",     true)
+local RF_GetLive        = makeRemote("GetLive",        true)
+local RF_GetServerInfo  = makeRemote("GetServerInfo",  true)
+local RF_GetScheduled   = makeRemote("GetScheduled",   true)
+local RF_GetRandom      = makeRemote("GetRandom",      true)
+local RE_AdminMessage      = makeRemote("AdminMessage",      false)
+local RE_ScheduledFired    = makeRemote("ScheduledFired",    false)
+local RE_GameEvent         = makeRemote("GameEvent",         false)
+local RE_DataModuleChanged = makeRemote("DataModuleChanged", false)  -- notify client khi DataModule thay đổi
+local RF_GetMyData         = makeRemote("GetMyData",         true)   -- client lấy data của chính mình
+local RF_GetOtherData      = makeRemote("GetOtherData",      true)   -- client lấy data player khác (chỉ khi online)
+local RE_DataExpired       = makeRemote("DataExpired",       false)  -- notify client khi data hết hạn (TTL)
+local RE_DataAttrChanged   = makeRemote("DataAttrChanged",   false)  -- notify client khi attribute mirror thay đổi
+
+-- ════════════════════════════════════════════
+--  DATAMODULE CLIENT SYNC HELPER
+-- ════════════════════════════════════════════
+
+-- Wrap onChange để tự động fire RE_DataModuleChanged tới client khi data thay đổi.
+-- Server → Client only → an toàn, không cần validate.
+local function _wrapOnChange(id, userOnChange)
+	return function(key, old, new)
+		for _, p in Players:GetPlayers() do
+			RE_DataModuleChanged:FireClient(p, { id=id, key=key, old=old, value=new })
+		end
+		if userOnChange then task.spawn(userOnChange, key, old, new) end
+	end
+end
+
+-- ════════════════════════════════════════════
+--  PLAYER DATA — CLIENT READ HELPERS
+-- ════════════════════════════════════════════
+
+-- Lọc bỏ field readOnly=true khỏi data trước khi gửi client
+-- readOnly ở đây có nghĩa là "server-only, không expose ra ngoài"
+-- ════════════════════════════════════════════
+--  PLAYER DATA — VISIBILITY FILTER
+--
+--  Mỗi field trong meta có thể đặt:
+--    visibility = "public"   → bản thân + người khác đều xem được  (mặc định)
+--    visibility = "private"  → chỉ bản thân xem được
+--    visibility = "secret"   → không ai xem được kể cả bản thân (chỉ server dùng nội bộ)
+--
+--  readOnly vẫn giữ nguyên ý nghĩa: không cho Set từ bên ngoài
+-- ════════════════════════════════════════════
+
+local VISIBILITY_PUBLIC  = "public"
+local VISIBILITY_PRIVATE = "private"
+local VISIBILITY_SECRET  = "secret"
+
+-- isSelf = true  → lọc cho chính player (bỏ secret)
+-- isSelf = false → lọc cho người khác   (bỏ secret + private)
+local function _filterByVisibility(data, meta, isSelf)
+	if type(data) ~= "table" then return data end
+	local result = {}
+	for k, v in pairs(data) do
+		local fieldMeta   = meta and meta[k]
+		local visibility  = fieldMeta and fieldMeta.visibility or VISIBILITY_PUBLIC
+
+		-- secret → không ai xem được
+		if visibility == VISIBILITY_SECRET then continue end
+		-- private → chỉ bản thân
+		if visibility == VISIBILITY_PRIVATE and not isSelf then continue end
+
+		-- Sub-table: lọc đệ quy
+		if type(v) == "table" and fieldMeta and fieldMeta.isTable then
+			result[k] = _filterByVisibility(v, fieldMeta.subMeta, isSelf)
+		else
+			result[k] = v
+		end
+	end
+	return result
+end
+
+-- Kiểm tra visibility của 1 field path cụ thể (dot-notation)
+-- Trả về visibility string hoặc "public" nếu không tìm thấy meta
+local function _getFieldVisibility(meta, fieldPath)
+	local parts     = fieldPath:split(".")
+	local fieldMeta = meta
+	for _, part in ipairs(parts) do
+		if type(fieldMeta) ~= "table" then return VISIBILITY_PUBLIC end
+		fieldMeta = fieldMeta[part] or (fieldMeta.subMeta and fieldMeta.subMeta[part])
+	end
+	if type(fieldMeta) == "table" then
+		return fieldMeta.visibility or VISIBILITY_PUBLIC
+	end
+	return VISIBILITY_PUBLIC
+end
+
+-- Lấy 1 field theo dot-notation, ví dụ "stats.kills"
+local function _getField(data, fieldPath)
+	local parts = fieldPath:split(".")
+	local cur = data
+	for _, part in ipairs(parts) do
+		if type(cur) ~= "table" then return nil end
+		cur = cur[part]
+	end
+	return cur
+end
+
+-- ════════════════════════════════════════════
+--           RATE LIMIT PROTECTION
+-- ════════════════════════════════════════════
+
+local RemoteCallTracker = {}
+local RATE_MAX = 10; local RATE_WINDOW = 5
+
+local function checkRateLimit(player, name)
+	local uid = tostring(player.UserId) .. "_" .. name
+	local now = os.time()
+	if not RemoteCallTracker[uid] then
+		RemoteCallTracker[uid] = { count = 0, win = now }
+	end
+	local t = RemoteCallTracker[uid]
+	if now - t.win >= RATE_WINDOW then t.count = 0; t.win = now end
+	t.count += 1
+	if t.count > RATE_MAX then
+		warn("RateLimit: " .. player.Name .. " / " .. name); return false
+	end
+	return true
+end
+
+local function cleanRateTracker(player)
+	local uid = tostring(player.UserId)
+	for k in pairs(RemoteCallTracker) do
+		if k:sub(1, #uid) == uid then RemoteCallTracker[k] = nil end
+	end
+end
+
+-- ════════════════════════════════════════════
+--        HELPERS — THOI GIAN
+-- ════════════════════════════════════════════
+
+local TimeUtil = {}
+
+function TimeUtil.toTimestamp(year, month, day, hour, minute, second)
+	if type(year) == "string" then
+		local s = year
+		local y, mo, d, h, mi, se
+		y,mo,d,h,mi,se = s:match("(%d+)-(%d+)-(%d+)%s+(%d+):(%d+):?(%d*)")
+		if not y then
+			d,mo,y,h,mi,se = s:match("(%d+)/(%d+)/(%d+)%s+(%d+):(%d+):?(%d*)")
+		end
+		if not y then
+			warn("TimeUtil: Khong parse duoc chuoi thoi gian — " .. s)
+			return nil
+		end
+		year=tonumber(y); month=tonumber(mo); day=tonumber(d)
+		hour=tonumber(h); minute=tonumber(mi); second=tonumber(se) or 0
+	elseif type(year) == "table" then
+		local t = year
+		year=t.year; month=t.month; day=t.day
+		hour=t.hour or 0; minute=t.minute or 0; second=t.second or 0
+	end
+	second = second or 0
+	local ok, ts = pcall(os.time, {
+		year=year, month=month, day=day,
+		hour=hour, min=minute, sec=second
+	})
+	if ok then return ts end
+	warn("TimeUtil: Ngay thang khong hop le"); return nil
+end
+
+function TimeUtil.format(ts)
+	return os.date("%d/%m/%Y %H:%M:%S", ts)
+end
+
+function TimeUtil.breakdown(ts)
+	local d = os.date("*t", ts)
+	return { year=d.year, month=d.month, day=d.day,
+		hour=d.hour, minute=d.min, second=d.sec }
+end
+
+-- ════════════════════════════════════════════
+--           SESSION DATA
+-- ════════════════════════════════════════════
+
+local SessionData = {}
+SessionData._data       = {}
+SessionData._events     = {}
+SessionData._playerList = {}
+
+function SessionData:Set(key, value)
+	self._data[key] = { value = value, updated = os.time() }
+end
+function SessionData:Get(key)
+	local e = self._data[key]; return e and e.value or nil
+end
+function SessionData:GetAll() return self._data end
+
+function SessionData:Log(eventType, data)
+	table.insert(self._events, {
+		type=eventType, data=data, time=os.time(), serverId=SERVER_ID
+	})
+end
+
+function SessionData:RegisterPlayer(player, isJoining)
+	local uid = tostring(player.UserId)
+	if isJoining then
+		self._playerList[uid] = { name=player.Name, userId=player.UserId, joined=os.time() }
+		self:Log("PLAYER_JOIN", { name=player.Name, userId=player.UserId })
+	else
+		if self._playerList[uid] then self._playerList[uid].left = os.time() end
+		self:Log("PLAYER_LEAVE", { name=player.Name, userId=player.UserId })
+	end
+end
+
+function SessionData:SaveEventLog()
+	if #self._events == 0 then return end
+	local key = "EventLog_" .. SERVER_ID .. "_" .. tostring(SERVER_START)
+	local ok, err = pcall(function()
+		EventLogStore:SetAsync(key, {
+			serverId=SERVER_ID, placeId=SERVER_PLACE,
+			startTime=SERVER_START, endTime=os.time(),
+			playerList=self._playerList, events=self._events,
+		})
+	end)
+	if ok then print("SessionData: Event log saved — " .. #self._events .. " events")
+	else warn("SessionData: Event log save failed — " .. tostring(err)) end
+end
+
+-- ════════════════════════════════════════════
+--           LIVE DATA
+-- ════════════════════════════════════════════
+
+local LiveData = {}
+
+function LiveData:Set(key, value, ttl)
+	ttl = ttl or 300
+	local ok, err = pcall(function()
+		MemoryLive:SetAsync(key, { value=value, setBy=SERVER_ID, setAt=os.time() }, ttl)
+	end)
+	if not ok then warn("LiveData:Set failed — " .. tostring(err)) end
+end
+function LiveData:Get(key)
+	local ok, r = pcall(function() return MemoryLive:GetAsync(key) end)
+	if ok and r then return r.value, r.setAt end
+	return nil, nil
+end
+function LiveData:Delete(key)
+	pcall(function() MemoryLive:RemoveAsync(key) end)
+end
+function LiveData:Update(key, fn, ttl)
+	ttl = ttl or 300
+	pcall(function()
+		MemoryLive:UpdateAsync(key, function(old)
+			local cur = old and old.value or nil
+			local nv = fn(cur)
+			if nv == nil then return nil end
+			return { value=nv, setBy=SERVER_ID, setAt=os.time() }
+		end, ttl)
+	end)
+end
+
+-- ════════════════════════════════════════════
+--           GLOBAL DATA
+-- ════════════════════════════════════════════
+
+local GlobalData = {}
+GlobalData._cache = {}
+
+local GLOBAL_TYPES = {
+	number=true, value=true, adminMessage=true,
+	shopPrice=true, eventState=true,
+}
+
+function GlobalData:Set(dataType, key, value)
+	if not GLOBAL_TYPES[dataType] then
+		warn("GlobalData: Type khong hop le — " .. tostring(dataType)); return false
+	end
+	local fullKey = dataType .. "_" .. key
+	local memOk, memErr = pcall(function()
+		MemoryGlobal:SetAsync(fullKey, {
+			value=value, type=dataType, setBy=SERVER_ID, setAt=os.time()
+		}, 86400)
+	end)
+	if not memOk then warn("GlobalData:Set Memory failed — " .. tostring(memErr)) end
+	if dataType == "shopPrice" or dataType == "eventState" then
+		local dsOk, dsErr = pcall(function()
+			GlobalStore:SetAsync(fullKey, { value=value, setAt=os.time() })
+		end)
+		if not dsOk then warn("GlobalData:Set DataStore failed — " .. tostring(dsErr)) end
+	end
+	self._cache[fullKey] = { value=value, time=os.time() }
+	pcall(function()
+		MessagingService:PublishAsync("GlobalUpdate",{
+			type=dataType, key=key, value=value, setBy=SERVER_ID
+		})
+	end)
+	return memOk
+end
+
+function GlobalData:Get(dataType, key)
+	local fullKey = dataType .. "_" .. key
+	local cached = self._cache[fullKey]
+	if cached and (os.time()-cached.time)<5 then return cached.value end
+	local ok, r = pcall(function() return MemoryGlobal:GetAsync(fullKey) end)
+	if ok and r then self._cache[fullKey]={value=r.value,time=os.time()}; return r.value end
+	local ok2, s = pcall(function() return GlobalStore:GetAsync(fullKey) end)
+	if ok2 and s then return s.value end
+	return nil
+end
+
+function GlobalData:Increment(key, amount)
+	local fullKey = "number_" .. key
+	pcall(function()
+		MemoryGlobal:UpdateAsync(fullKey, function(old)
+			return { value=(old and old.value or 0)+amount, type="number", setBy=SERVER_ID, setAt=os.time() }
+		end, 86400)
+	end)
+	pcall(function()
+		MessagingService:PublishAsync("GlobalUpdate",{
+			type="number", key=key, amount=amount, op="increment", setBy=SERVER_ID
+		})
+	end)
+end
+
+function GlobalData:AdminBroadcast(message, duration)
+	duration = duration or 60
+	self:Set("adminMessage","current",{message=message,duration=duration,sentAt=os.time()})
+	pcall(function()
+		MessagingService:PublishAsync("AdminBroadcast",{
+			message=message, duration=duration, sentAt=os.time()
+		})
+	end)
+end
+
+-- ════════════════════════════════════════════
+--           CONFLICT RESOLVER
+-- ════════════════════════════════════════════
+
+local ConflictResolver = {}
+
+function ConflictResolver:SaveExitStamp(player)
+	pcall(function()
+		MemorySession:SetAsync("Exit_"..player.UserId, {
+			userId=player.UserId, exitTime=os.time(),
+			serverId=SERVER_ID, placeId=SERVER_PLACE,
+		}, 300)
+	end)
+end
+
+function ConflictResolver:CheckOnJoin(player)
+	local ok, info = pcall(function()
+		return MemorySession:GetAsync("Exit_"..player.UserId)
+	end)
+	if not ok or not info then return { conflict=false, reason="no_exit_stamp" } end
+	if info.serverId ~= SERVER_ID then
+		local diff = os.time() - info.exitTime
+		if diff < 30 then
+			return { conflict=true, reason="recent_server_switch",
+				exitTime=info.exitTime, fromServer=info.serverId, timeDiff=diff }
+		end
+	end
+	return { conflict=false, reason="safe" }
+end
+
+function ConflictResolver:MergeData(localData, remoteData)
+	if not remoteData then return localData end
+	if not localData  then return remoteData end
+	local merged, allSections = {}, {}
+	for s in pairs(localData)  do allSections[s]=true end
+	for s in pairs(remoteData) do allSections[s]=true end
+	for section in pairs(allSections) do
+		merged[section] = {}
+		local lf = localData[section]  or {}
+		local rf = remoteData[section] or {}
+		local allKeys = {}
+		for k in pairs(lf) do allKeys[k]=true end
+		for k in pairs(rf) do allKeys[k]=true end
+		for key in pairs(allKeys) do
+			local lv, rv = lf[key], rf[key]
+			if rv == nil then
+				merged[section][key] = lv
+			elseif lv == nil then
+				merged[section][key] = rv
+			elseif type(lv) == "number" and type(rv) == "number" then
+				merged[section][key] = math.max(lv, rv)
+			else
+				merged[section][key] = rv
+			end
+		end
+	end
+	return merged
+end
+
+-- ════════════════════════════════════════════
+--           SCHEDULED DATA
+-- ════════════════════════════════════════════
+
+local ScheduledData = {}
+ScheduledData._jobs      = {}
+ScheduledData._callbacks = {}
+
+local function resolveTime(t)
+	if type(t) == "number" then return t end
+	if type(t) == "string" then return TimeUtil.toTimestamp(t) end
+	if type(t) == "table"  then
+		return TimeUtil.toTimestamp(t.year,t.month,t.day,t.hour or 0,t.minute or 0,t.second or 0)
+	end
+	return nil
+end
+
+function ScheduledData:Register(jobId, dataType, payload, startTime, endTime, meta)
+	if not GLOBAL_TYPES[dataType] then
+		warn("ScheduledData: dataType khong hop le — "..tostring(dataType)); return false
+	end
+	local st = resolveTime(startTime)
+	local et = endTime and resolveTime(endTime) or nil
+	if not st then warn("ScheduledData: startTime khong hop le"); return false end
+	if et and et <= st then warn("ScheduledData: endTime phai sau startTime"); return false end
+	local job = {
+		jobId=jobId, dataType=dataType, payload=payload,
+		startTime=st, endTime=et, meta=meta or {},
+		status="pending", createdAt=os.time(), createdBy=SERVER_ID,
+	}
+	local dsOk, dsErr = pcall(function() ScheduledStore:SetAsync("Job_"..jobId, job) end)
+	if not dsOk then warn("ScheduledData:Register DS failed — "..tostring(dsErr)); return false end
+	local ttl = et and math.max(et-os.time()+300,60) or 86400*7
+	pcall(function() MemoryScheduled:SetAsync("Job_"..jobId, job, ttl) end)
+	self._jobs[jobId] = job
+	print(string.format("ScheduledData: [%s] registered -> %s", jobId, TimeUtil.format(st)))
+	return true
+end
+
+function ScheduledData:Cancel(jobId)
+	local job = self._jobs[jobId]
+	if not job then warn("ScheduledData: job khong ton tai — "..tostring(jobId)); return false end
+	if job.status=="active" or job.status=="ended" then
+		warn("ScheduledData: khong the huy job da "..job.status); return false
+	end
+	job.status = "cancelled"
+	pcall(function() MemoryScheduled:RemoveAsync("Job_"..jobId) end)
+	pcall(function()
+		ScheduledStore:UpdateAsync("Job_"..jobId, function(o)
+			if o then o.status="cancelled" end; return o
+		end)
+	end)
+	self._jobs[jobId] = nil
+	return true
+end
+
+function ScheduledData:UpdateActive(jobId, newPayload)
+	local job = self._jobs[jobId]
+	if not job or job.status~="active" then
+		warn("ScheduledData: job khong active — "..tostring(jobId)); return false
+	end
+	job.payload = newPayload
+	GlobalData:Set(job.dataType, jobId, newPayload)
+	local rem = job.endTime and math.max(job.endTime-os.time()+60,60) or 86400
+	pcall(function() MemoryScheduled:SetAsync("Job_"..jobId, job, rem) end)
+	pcall(function()
+		ScheduledStore:UpdateAsync("Job_"..jobId, function(o)
+			if o then o.payload=newPayload end; return o
+		end)
+	end)
+	return true
+end
+
+function ScheduledData:OnFired(jobId, cb) self._callbacks[jobId] = cb end
+function ScheduledData:GetJob(jobId) return self._jobs[jobId] end
+function ScheduledData:GetAll(fs)
+	local r={}
+	for id,j in pairs(self._jobs) do
+		if not fs or j.status==fs then r[id]=j end
+	end
+	return r
+end
+
+local function _fireJob(job)
+	job.status="active"; job.firedAt=os.time()
+	GlobalData:Set(job.dataType, job.jobId, job.payload)
+	pcall(function()
+		MessagingService:PublishAsync("ScheduledFired",{
+			jobId=job.jobId, dataType=job.dataType, payload=job.payload, firedAt=job.firedAt
+		})
+	end)
+	local cb = ScheduledData._callbacks[job.jobId]
+	if cb then task.spawn(cb, job) end
+	for _, p in Players:GetPlayers() do
+		RE_ScheduledFired:FireClient(p,{jobId=job.jobId,dataType=job.dataType,payload=job.payload})
+	end
+	pcall(function()
+		ScheduledStore:UpdateAsync("Job_"..job.jobId, function(o)
+			if o then o.status="active"; o.firedAt=job.firedAt end; return o
+		end)
+	end)
+	SessionData:Log("SCHEDULED_FIRED",{jobId=job.jobId,dataType=job.dataType})
+	print(string.format("ScheduledData: FIRED [%s]", job.jobId))
+end
+
+local function _endJob(job)
+	job.status="ended"; job.endedAt=os.time()
+	GlobalData:Set(job.dataType, job.jobId, nil)
+	pcall(function()
+		MessagingService:PublishAsync("ScheduledEnded",{jobId=job.jobId,endedAt=job.endedAt})
+	end)
+	pcall(function()
+		ScheduledStore:UpdateAsync("Job_"..job.jobId, function(o)
+			if o then o.status="ended"; o.endedAt=job.endedAt end; return o
+		end)
+	end)
+	SessionData:Log("SCHEDULED_ENDED",{jobId=job.jobId})
+	print(string.format("ScheduledData: ENDED [%s]", job.jobId))
+end
+
+local function _loadPersistedJobs()
+	local ok, pages = pcall(function()
+		return MemoryScheduled:GetRangeAsync(Enum.SortDirection.Ascending, 50)
+	end)
+	if ok and pages then
+		for _, e in ipairs(pages) do
+			local j = e.value
+			if j and j.jobId and (j.status=="pending" or j.status=="active") then
+				ScheduledData._jobs[j.jobId] = j
+			end
+		end
+	end
+end
+
+task.spawn(function()
+	task.wait(5)
+	_loadPersistedJobs()
+	while true do
+		task.wait(5)
+		local now = os.time()
+		for id, job in pairs(ScheduledData._jobs) do
+			if job.status=="pending" and now >= job.startTime then
+				_fireJob(job)
+			elseif job.status=="active" and job.endTime and now >= job.endTime then
+				_endJob(job)
+				ScheduledData._jobs[id] = nil
+			end
+		end
+	end
+end)
+
+-- ════════════════════════════════════════════
+--  RANDOM DATA
+-- ════════════════════════════════════════════
+
+local RandomData = {}
+RandomData._pools = {}
+RandomData._rng   = Random.new()
+
+local function weightedPick(items, rng)
+	local total = 0
+	for _, item in ipairs(items) do total += (item.weight or 1) end
+	local roll = (rng or RandomData._rng):NextNumber() * total
+	for _, item in ipairs(items) do
+		roll -= (item.weight or 1)
+		if roll <= 0 then return item end
+	end
+	return items[#items]
+end
+
+local function makeSeededRng(seed)
+	if type(seed) == "string" then
+		local h = 0
+		local seedLen = string.len(seed)
+		for i = 1, seedLen do h = h * 31 + string.byte(seed, i) end
+		return Random.new(h)
+	end
+	return Random.new(seed)
+end
+
+function RandomData:RegisterPool(poolId, config)
+	self._pools[poolId] = config
+	print("RandomData: Pool registered — " .. poolId)
+end
+
+function RandomData:FromList(items)
+	if not items or #items == 0 then return nil end
+	return items[self._rng:NextInteger(1, #items)]
+end
+
+function RandomData:InRange(min, max, isFloat)
+	if isFloat then return self._rng:NextNumber(min, max) end
+	return self._rng:NextInteger(math.floor(min), math.floor(max))
+end
+
+function RandomData:Weighted(items)
+	return weightedPick(items)
+end
+
+function RandomData:WeightedMulti(items, count)
+	local results = {}
+	for i = 1, count do results[i] = weightedPick(items) end
+	return results
+end
+
+function RandomData:Seeded(seed, mode, args)
+	local rng = makeSeededRng(seed)
+	if mode == "list" then
+		local items = args[1]
+		return items[rng:NextInteger(1, #items)]
+	elseif mode == "range" then
+		if args[3] then return rng:NextNumber(args[1], args[2])
+		else return rng:NextInteger(math.floor(args[1]), math.floor(args[2])) end
+	elseif mode == "weighted" then
+		return weightedPick(args[1], rng)
+	end
+	return nil
+end
+
+function RandomData:BonusStack(config)
+	local base = self:InRange(config.base.min, config.base.max, config.base.isFloat)
+	local total = base
+	local breakdown = { { name="base", value=base } }
+	for _, bonus in ipairs(config.bonuses or {}) do
+		local bval
+		if bonus.weighted then
+			local picked = weightedPick(bonus.items)
+			bval = picked and (picked.value or 0) or 0
+		elseif bonus.min and bonus.max then
+			bval = self:InRange(bonus.min, bonus.max, bonus.isFloat)
+		else
+			bval = bonus.value or 0
+		end
+		total += bval
+		table.insert(breakdown, { name=bonus.name, value=bval })
+	end
+	return { total=total, base=base, breakdown=breakdown }
+end
+
+function RandomData:Roll(poolId, overrides)
+	local config = self._pools[poolId]
+	if not config then
+		warn("RandomData: Pool khong ton tai — " .. tostring(poolId)); return nil
+	end
+	if overrides then
+		config = table.clone(config)
+		for k, v in pairs(overrides) do config[k] = v end
+	end
+	local mode = config.mode
+	if mode == "list"         then return self:FromList(config.items)
+	elseif mode == "range"    then return self:InRange(config.min, config.max, config.isFloat)
+	elseif mode == "weighted" then return self:Weighted(config.items)
+	elseif mode == "seeded"   then return self:Seeded(config.seed, config.seedMode, config.args)
+	elseif mode == "bonusStack" then return self:BonusStack(config) end
+	warn("RandomData: mode khong hop le — " .. tostring(mode)); return nil
+end
+
+-- ════════════════════════════════════════════
+--  GAME EVENT LOG
+-- ════════════════════════════════════════════
+
+local GameEventLog = {}
+GameEventLog._sessions = {}
+
+function GameEventLog:StartSession(player)
+	local uid = tostring(player.UserId)
+	local snapshot = nil
+	local ok, snap = pcall(function()
+		return PlayerSnapStore:GetAsync("Snap_" .. uid)
+	end)
+	if ok and snap then snapshot = snap end
+
+	self._sessions[uid] = {
+		userId       = player.UserId,
+		name         = player.Name,
+		sessionStart = os.time(),
+		lastSeen     = os.time(),
+		events       = {},
+		checkpoint   = snapshot and snapshot.checkpoint or nil,
+		position     = snapshot and snapshot.position   or nil,
+		customData   = snapshot and snapshot.customData or {},
+		isResumed    = snapshot ~= nil,
+	}
+
+	self:Push(player, "SESSION_START", {
+		resumed    = snapshot ~= nil,
+		checkpoint = self._sessions[uid].checkpoint,
+	})
+
+	if snapshot then
+		print(string.format("GameEventLog: [%s] RESUMED tu checkpoint [%s]",
+			player.Name, tostring(snapshot.checkpoint)))
+	end
+	return self._sessions[uid]
+end
+
+function GameEventLog:Push(player, eventType, data)
+	local uid = tostring(player.UserId)
+	local session = self._sessions[uid]
+	if not session then
+		warn("GameEventLog: Khong co session cho " .. player.Name); return
+	end
+	local event = {
+		type    = eventType,
+		data    = data or {},
+		time    = os.time(),
+		elapsed = os.time() - session.sessionStart,
+	}
+	table.insert(session.events, event)
+	session.lastSeen = os.time()
+	RE_GameEvent:FireClient(player, { type=eventType, data=data })
+end
+
+function GameEventLog:UpdateSnapshot(player, position, checkpoint, customData)
+	local uid = tostring(player.UserId)
+	local session = self._sessions[uid]
+	if not session then return end
+	if position   then session.position   = position   end
+	if checkpoint then session.checkpoint = checkpoint end
+	if customData then
+		for k, v in pairs(customData) do session.customData[k] = v end
+	end
+	session.lastSeen = os.time()
+	task.spawn(function()
+		pcall(function()
+			PlayerSnapStore:SetAsync("Snap_" .. uid, {
+				userId     = player.UserId,
+				name       = player.Name,
+				checkpoint = session.checkpoint,
+				position   = session.position,
+				customData = session.customData,
+				savedAt    = os.time(),
+				serverId   = SERVER_ID,
+			})
+		end)
+	end)
+end
+
+function GameEventLog:GetSnapshot(player)
+	local uid = tostring(player.UserId)
+	local session = self._sessions[uid]
+	if session then
+		return {
+			checkpoint = session.checkpoint,
+			position   = session.position,
+			customData = session.customData,
+			isResumed  = session.isResumed,
+		}
+	end
+	local ok, snap = pcall(function()
+		return PlayerSnapStore:GetAsync("Snap_" .. uid)
+	end)
+	if ok and snap then return snap end
+	return nil
+end
+
+function GameEventLog:ClearSnapshot(player)
+	local uid = tostring(player.UserId)
+	if self._sessions[uid] then
+		self._sessions[uid].checkpoint = nil
+		self._sessions[uid].position   = nil
+		self._sessions[uid].customData = {}
+	end
+	pcall(function() PlayerSnapStore:RemoveAsync("Snap_" .. uid) end)
+end
+
+function GameEventLog:EndSession(player)
+	local uid = tostring(player.UserId)
+	local session = self._sessions[uid]
+	if not session then return end
+	self:Push(player, "SESSION_END", {
+		totalTime = os.time() - session.sessionStart,
+		events    = #session.events,
+	})
+	local sessionKey = string.format("Session_%s_%s", uid, tostring(SERVER_START))
+	task.spawn(function()
+		local ok, err = pcall(function()
+			GameEventStore:SetAsync(sessionKey, {
+				userId          = player.UserId,
+				name            = player.Name,
+				serverId        = SERVER_ID,
+				sessionStart    = session.sessionStart,
+				sessionEnd      = os.time(),
+				totalTime       = os.time() - session.sessionStart,
+				events          = session.events,
+				finalCheckpoint = session.checkpoint,
+				finalPosition   = session.position,
+				customData      = session.customData,
+			})
+		end)
+		if not ok then warn("GameEventLog: Save failed — " .. tostring(err)) end
+	end)
+	self._sessions[uid] = nil
+end
+
+function GameEventLog:GetSession(player)
+	return self._sessions[tostring(player.UserId)]
+end
+
+function GameEventLog:GetSessionTime(player)
+	local s = self._sessions[tostring(player.UserId)]
+	return s and (os.time() - s.sessionStart) or 0
+end
+
+-- ════════════════════════════════════════════
+--  PLAYER DATA SYSTEM
+-- ════════════════════════════════════════════
+--
+--  Cấu trúc folder trong script (case-insensitive tên "DataStore"):
+--
+--  Script
+--   └── DataStore/                        ← tên bất kỳ (datastore/DATASTORE/DataStore)
+--        [Attr] StoreName   = "CoursePlayer"   ← tên DataStore (bắt buộc)
+--        [Attr] KeyMode     = "id"               ← "id" | "name" | "seed"
+--        [Attr] KeySeed     = "MySeed2025"       ← chỉ dùng khi KeyMode = "seed"
+--        [Attr] AutoSave    = true               ← tự lưu mỗi 60 giây
+--        [Attr] MaxHistory  = 20                 ← số version lưu tối đa
+--        [Attr] SchemaVersion = 2               ← version hiện tại của schema
+--        │
+--        ├── coins         (NumberValue = 0)
+--        │    [Attr] OldName  = "gold"           ← tên data cũ cần migrate
+--        │    [Attr] Min      = 0                ← giới hạn tối thiểu
+--        │    [Attr] Max      = 999999           ← giới hạn tối đa
+--        │    [Attr] ReadOnly = false            ← không cho phép Set từ client
+--        │
+--        ├── level         (NumberValue = 1)
+--        │    [Attr] Min = 1; [Attr] Max = 100
+--        │
+--        ├── username      (StringValue = "")
+--        │    [Attr] OldName = "playerName"
+--        │
+--        ├── isPremium     (BoolValue = false)
+--        │
+--        ├── inventory     (Folder)             ← sub-table
+--        │    sword   (BoolValue = false)
+--        │    shield  (BoolValue = false)
+--        │
+--        └── stats         (Folder)
+--              kills  (NumberValue = 0)
+--              deaths (NumberValue = 0)
+--
+--  ─────────────────────────────────────────────
+--  3 Hình thức KeyMode:
+--    "id"   → key = StoreName .. "_" .. UserId
+--             Ví dụ: "CoursePlayer_123456789"
+--    "name" → key = StoreName .. "_" .. PlayerName (lower)
+--             Ví dụ: "CoursePlayer_heroname"
+--    "seed" → key = StoreName .. "_" .. hash(KeySeed .. UserId)
+--             Ví dụ: "CoursePlayer_a3f9c2" (obfuscated)
+--
+--  Bạn có thể bật/tắt từng mode bằng [Attr] AllowId / AllowName / AllowSeed
+--  và chọn mode active bằng [Attr] KeyMode
+-- ════════════════════════════════════════════
+
+local PlayerData = {}
+PlayerData._cache       = {}   -- { [userId] = { data, key, storeName, meta } }
+PlayerData._schemas     = {}   -- { [storeName] = schemaTable }
+PlayerData._stores      = {}   -- { [storeName] = DataStore object }
+PlayerData._configs     = {}   -- { [storeName] = configTable }
+PlayerData._dirty       = {}   -- { [userId_storeName] = true } cần save
+PlayerData._bonuses     = {}   -- { [userId_storeName] = { [fieldPath] = { {name,flat,mult}, ... } } }
+PlayerData._ttlHandles       = {}   -- forward declare — populated lại ở TTL PATCH section bên dưới
+PlayerData._pendingMigration = {}   -- { [userId_storeName] = { oldData, oldKey, oldStore, detectedAt } }
+
+-- Forward declare TTLCore để onPlayerRemoving có thể gọi TTLCore:Cancel trước khi TTLCore được định nghĩa đầy đủ
+local TTLCore = {}
+
+-- ────────────────────────────────────────────
+--  HELPER: đọc value object
+-- ────────────────────────────────────────────
+local function _readVal(obj)
+	local cn = obj.ClassName
+	if cn == "StringValue"  then return obj.Value
+	elseif cn == "NumberValue"  then return obj.Value
+	elseif cn == "BoolValue"    then return obj.Value
+	elseif cn == "IntValue"     then return obj.Value
+	elseif cn == "Color3Value"  then return obj.Value
+	elseif cn == "Vector3Value" then return { x=obj.Value.X, y=obj.Value.Y, z=obj.Value.Z }
+	elseif cn == "CFrameValue"  then
+		local cf = obj.Value
+		return { px=cf.X, py=cf.Y, pz=cf.Z }
+	end
+	return nil
+end
+
+local function _readAttrs(inst)
+	local ok, result = pcall(function() return inst:GetAttributes() end)
+	return ok and result or {}
+end
+
+-- Wrapper đọc attribute case-insensitive
+-- Ví dụ: _getAttr(attrs, "storename") sẽ tìm "StoreName", "storename", "STORENAME" đều ra
+local function _getAttr(attrs, name)
+	-- Thử exact trước (nhanh nhất)
+	if attrs[name] ~= nil then return attrs[name] end
+	-- Không ra → scan toàn bộ keys bằng lower
+	local nameLower = name:lower()
+	for k, v in pairs(attrs) do
+		if k:lower() == nameLower then return v end
+	end
+	return nil
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: đọc schema từ folder đệ quy
+--  Trả về { defaults, meta }
+--  defaults = giá trị mặc định
+--  meta     = { [fieldName] = { oldName, min, max, readOnly, ... } }
+--
+--  Mỗi Value object con có thể override các attribute cấp store:
+--    KeyMode       — "id" | "name" | "seed"
+--    KeySeed       — seed riêng cho field này (dùng khi KeyMode="seed")
+--    AllowId       — bool, mặc định kế thừa folder cha
+--    AllowName     — bool, mặc định kế thừa folder cha
+--    AllowSeed     — bool, mặc định kế thừa folder cha
+--    AutoSave      — bool (nil/không đặt = true), false = không auto-save field này
+--    MaxHistory    — number (-1 = infinite), ghi đè maxHistory của store cho field này
+--    OldKeyPrefix  — string, prefix key cũ riêng cho field này
+--    OldStoreName  — string, store cũ riêng cho field này
+--    OldKeySeed    — string, seed cũ riêng cho field này
+--
+--  ── DATA RESET (tự reset về default sau 1 khoảng thời gian, tính từ lúc SAVE) ──
+--    ResetAfter    — string hoặc number:
+--      Dạng string  : "1d", "2d", "1w", "1month", "1year",
+--                     "3h", "30m", "90s", "1d12h30m",
+--                     hoặc kết hợp "2d 6h 30m 15s"
+--      Dạng number  : số giây nguyên (ví dụ 86400 = 1 ngày)
+--      Khi hết hạn → field reset về default (value mặc định của Value object)
+--
+--  ── DATA HẾT HẠN (field bị xóa/nil tại thời điểm cụ thể) ──
+--    ExpireAt      — string ngày giờ cố định:
+--      Định dạng hỗ trợ:
+--        "1-1-2030 14:01"      (d-m-yyyy HH:MM)
+--        "2030-12-31 23:59"    (yyyy-mm-dd HH:MM)
+--        "31/12/2030 08:00"    (dd/mm/yyyy HH:MM)
+--        "2030-12-31"          (chỉ ngày, giờ = 00:00)
+--      Khi quá thời điểm đó → field trả về nil (xem như không tồn tại)
+--
+--  Nếu attribute không đặt trên Value object → nil (kế thừa cấu hình Folder cha)
+-- ────────────────────────────────────────────
+-- ────────────────────────────────────────────
+--  HELPER: parse ResetAfter → số giây
+--  Hỗ trợ:
+--    number        → giây nguyên
+--    "86400"       → parse thành number
+--    "1d", "2d", "1w", "1month", "1year"
+--    "3h", "30m", "90s"
+--    kết hợp: "1d12h30m15s", "2d 6h", "1month 2d"
+-- ────────────────────────────────────────────
+local function _parseResetAfter(raw)
+	if type(raw) == "number" then
+		return raw > 0 and raw or nil
+	end
+	if type(raw) ~= "string" then return nil end
+	-- Thử parse thẳng thành số giây
+	local asNum = tonumber(raw)
+	if asNum then return asNum > 0 and asNum or nil end
+
+	local total = 0
+	local s = raw:lower():gsub("%s+", "")  -- bỏ khoảng trắng
+
+	-- Thứ tự parse: year → month → week → day → hour → minute → second
+	local function consume(pattern, secs)
+		local n = s:match("^(%d+)" .. pattern) or s:match("(%d+)" .. pattern)
+		if n then total = total + tonumber(n) * secs end
+	end
+
+	consume("year[s]?",   365 * 24 * 3600)
+	consume("month[s]?",   30 * 24 * 3600)
+	consume("w",            7 * 24 * 3600)
+	consume("d",                24 * 3600)
+	consume("h",                     3600)
+	consume("m",                       60)
+	consume("s",                        1)
+
+	return total > 0 and total or nil
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: parse ExpireAt → timestamp Unix
+--  Hỗ trợ:
+--    "1-1-2030 14:01"      → d-m-yyyy HH:MM
+--    "2030-12-31 23:59"    → yyyy-mm-dd HH:MM
+--    "31/12/2030 08:00"    → dd/mm/yyyy HH:MM
+--    "2030-12-31"          → chỉ ngày, giờ 00:00
+--    "1/1/2030"            → chỉ ngày, giờ 00:00
+-- ────────────────────────────────────────────
+local function _parseExpireAt(raw)
+	if type(raw) ~= "string" then return nil end
+	local y, mo, d, h, mi
+
+	-- yyyy-mm-dd HH:MM  hoặc  yyyy-mm-dd
+	y, mo, d, h, mi = raw:match("^(%d%d%d%d)-(%d%d?)-(%d%d?)%s+(%d%d?):(%d%d?)")
+	if not y then y, mo, d = raw:match("^(%d%d%d%d)-(%d%d?)-(%d%d?)$") end
+
+	-- dd/mm/yyyy HH:MM  hoặc  d/m/yyyy
+	if not y then
+		d, mo, y, h, mi = raw:match("^(%d%d?)/(%d%d?)/(%d%d%d%d)%s+(%d%d?):(%d%d?)")
+		if not y then d, mo, y = raw:match("^(%d%d?)/(%d%d?)/(%d%d%d%d)$") end
+	end
+
+	-- d-m-yyyy HH:MM  hoặc  d-m-yyyy
+	if not y then
+		d, mo, y, h, mi = raw:match("^(%d%d?)-(%d%d?)-(%d%d%d%d)%s+(%d%d?):(%d%d?)")
+		if not y then d, mo, y = raw:match("^(%d%d?)-(%d%d?)-(%d%d%d%d)$") end
+	end
+
+	if not y then
+		warn(string.format("[ExpireAt] Không parse được '%s' — bỏ qua", raw))
+		return nil
+	end
+
+	local ok, ts = pcall(os.time, {
+		year  = tonumber(y),
+		month = tonumber(mo),
+		day   = tonumber(d),
+		hour  = tonumber(h)  or 0,
+		min   = tonumber(mi) or 0,
+		sec   = 0,
+	})
+	if not ok then
+		warn(string.format("[ExpireAt] Ngày không hợp lệ '%s'", raw))
+		return nil
+	end
+	return ts
+end
+
+-- Forward declare để _readSchema có thể gọi đệ quy chính nó
+local _readSchema
+
+_readSchema = function(folder)
+	local defaults = {}
+	local meta     = {}
+
+	for _, child in ipairs(folder:GetChildren()) do
+		local val = _readVal(child)
+		if val ~= nil then
+			-- Value object → field đơn giản
+			defaults[child.Name] = val
+			local attrs = _readAttrs(child)
+
+			-- ── Attribute cơ bản của field ──
+			local fieldMeta = {
+				oldName   = _getAttr(attrs, "OldName")   or nil,
+				min       = _getAttr(attrs, "Min")       or nil,
+				max       = _getAttr(attrs, "Max")       or nil,
+				readOnly  = _getAttr(attrs, "ReadOnly")  or false,
+				default   = val,
+				type      = child.ClassName,
+				bonusFlat = _getAttr(attrs, "BonusFlat") or 0,
+				bonusMult = _getAttr(attrs, "BonusMult") or 1,
+				visibility = _getAttr(attrs, "Visibility") or nil,
+			}
+
+			-- ── Attribute cấp store override (nil = kế thừa folder cha) ──
+			-- KeyMode / KeySeed / AllowId / AllowName / AllowSeed
+			local keyMode  = _getAttr(attrs, "KeyMode")
+			local keySeed  = _getAttr(attrs, "KeySeed")
+			local allowId  = _getAttr(attrs, "AllowId")
+			local allowName= _getAttr(attrs, "AllowName")
+			local allowSeed= _getAttr(attrs, "AllowSeed")
+			if keyMode   ~= nil then fieldMeta.keyMode   = keyMode   end
+			if keySeed   ~= nil then fieldMeta.keySeed   = keySeed   end
+			if allowId   ~= nil then fieldMeta.allowId   = allowId   end
+			if allowName ~= nil then fieldMeta.allowName = allowName  end
+			if allowSeed ~= nil then fieldMeta.allowSeed = allowSeed  end
+
+			-- AutoSave: nil/không đặt = kế thừa (mặc định true), false = tắt riêng field này
+			local autoSave = _getAttr(attrs, "AutoSave")
+			if autoSave ~= nil then fieldMeta.autoSave = autoSave end
+
+			-- MaxHistory: nil = kế thừa, -1 = infinite
+			local maxHistory = _getAttr(attrs, "MaxHistory")
+			if maxHistory ~= nil then
+				fieldMeta.maxHistory = (maxHistory == -1) and math.huge or maxHistory
+			end
+
+			-- OldKeyPrefix / OldStoreName / OldKeySeed
+			local oldKeyPrefix = _getAttr(attrs, "OldKeyPrefix")
+			local oldStoreName = _getAttr(attrs, "OldStoreName")
+			local oldKeySeed   = _getAttr(attrs, "OldKeySeed")
+			if oldKeyPrefix ~= nil and oldKeyPrefix ~= "" then fieldMeta.oldKeyPrefix = oldKeyPrefix end
+			if oldStoreName ~= nil and oldStoreName ~= "" then fieldMeta.oldStoreName = oldStoreName end
+			if oldKeySeed   ~= nil and oldKeySeed   ~= "" then fieldMeta.oldKeySeed   = oldKeySeed   end
+
+			-- ── ResetAfter: reset về default sau N giây kể từ lúc save ──
+			local resetAfterRaw = _getAttr(attrs, "ResetAfter")
+			if resetAfterRaw ~= nil then
+				local secs = _parseResetAfter(resetAfterRaw)
+				if secs then
+					fieldMeta.resetAfterSecs = secs
+					print(string.format("[Schema] '%s' ResetAfter=%ss (%s)",
+						child.Name, tostring(secs), tostring(resetAfterRaw)))
+				else
+					warn(string.format("[Schema] '%s' ResetAfter='%s' không hợp lệ — bỏ qua",
+						child.Name, tostring(resetAfterRaw)))
+				end
+			end
+
+			-- ── ExpireAt: field bị nil cứng tại timestamp cố định ──
+			local expireAtRaw = _getAttr(attrs, "ExpireAt")
+			if expireAtRaw ~= nil then
+				local ts = _parseExpireAt(tostring(expireAtRaw))
+				if ts then
+					fieldMeta.expireAtTs = ts
+					print(string.format("[Schema] '%s' ExpireAt=%s (unix %d)",
+						child.Name, tostring(expireAtRaw), ts))
+				end
+			end
+
+			meta[child.Name] = fieldMeta
+
+		elseif child:IsA("Folder") then
+			-- Folder → sub-table đệ quy
+			local sub, subMeta = _readSchema(child)
+			defaults[child.Name] = sub
+			meta[child.Name] = {
+				isTable  = true,
+				subMeta  = subMeta,
+				default  = sub,
+			}
+		end
+	end
+
+	return defaults, meta
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: lấy config hiệu quả của 1 field
+--  Merge config store (folder cha) với override từ fieldMeta (Value object)
+--  Thứ tự ưu tiên: fieldMeta > storeConfig > default
+-- ────────────────────────────────────────────
+local function _resolveFieldConfig(storeConfig, fieldMeta)
+	if not fieldMeta then return storeConfig end
+	return {
+		storeName    = storeConfig.storeName,
+		keyMode      = fieldMeta.keyMode      or storeConfig.keyMode      or "id",
+		keySeed      = fieldMeta.keySeed      or storeConfig.keySeed      or "DEFAULT_SEED",
+		allowId      = fieldMeta.allowId      ~= nil and fieldMeta.allowId   or storeConfig.allowId,
+		allowName    = fieldMeta.allowName    ~= nil and fieldMeta.allowName  or storeConfig.allowName,
+		allowSeed    = fieldMeta.allowSeed    ~= nil and fieldMeta.allowSeed  or storeConfig.allowSeed,
+		autoSave     = fieldMeta.autoSave     ~= nil and fieldMeta.autoSave   or storeConfig.autoSave,
+		maxHistory   = fieldMeta.maxHistory   ~= nil and fieldMeta.maxHistory or storeConfig.maxHistory,
+		oldKeyPrefix = fieldMeta.oldKeyPrefix or storeConfig.oldKeyPrefix,
+		oldStoreName = fieldMeta.oldStoreName or storeConfig.oldStoreName,
+		oldKeySeed   = fieldMeta.oldKeySeed   or storeConfig.oldKeySeed,
+		schemaVersion= storeConfig.schemaVersion,
+	}
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: sinh key theo KeyMode
+-- ────────────────────────────────────────────
+local function _makeHash(str)
+	local h = 5381
+	for i = 1, #str do
+		h = (h * 33 + string.byte(str, i)) % 2147483647
+	end
+	return string.format("%x", h)
+end
+
+function PlayerData._buildKey(config, player)
+	local mode  = (config.keyMode or "id"):lower()
+	local store = config.storeName
+
+	-- kiểm tra mode có được bật không
+	if mode == "id" and config.allowId == false then
+		warn("PlayerData: KeyMode 'id' bị tắt trong config"); return nil
+	end
+	if mode == "name" and config.allowName == false then
+		warn("PlayerData: KeyMode 'name' bị tắt trong config"); return nil
+	end
+	if mode == "seed" and config.allowSeed == false then
+		warn("PlayerData: KeyMode 'seed' bị tắt trong config"); return nil
+	end
+
+	if mode == "id" then
+		-- Hình thức 1: UserId
+		return store .. "_" .. tostring(player.UserId)
+
+	elseif mode == "name" then
+		-- Hình thức 2: Tên player (lowercase để nhất quán)
+		return store .. "_" .. player.Name:lower()
+
+	elseif mode == "seed" then
+		-- Hình thức 3: Hash từ seed + UserId (obfuscated, reproducible)
+		local seed = config.keySeed or "DEFAULT_SEED"
+		local raw  = seed .. tostring(player.UserId)
+		return store .. "_" .. _makeHash(raw)
+	end
+
+	-- fallback về id
+	return store .. "_" .. tostring(player.UserId)
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: sinh danh sách key cũ có thể có
+--
+--  oldKeyPrefix = phần prefix muốn dùng thay storeName, ví dụ:
+--    "player"    → thử "player_123456", "player_heroname", "player_<hash>"
+--    "player_v1" → thử "player_v1_123456", "player_v1_heroname", "player_v1_<hash>"
+--    ""  / nil   → dùng storeName gốc (thử tất cả 3 mode)
+--
+--  Trả về list { key, mode } theo thứ tự ưu tiên: id → name → seed
+-- ────────────────────────────────────────────
+local function _buildOldKeys(config, player)
+	local prefix = config.oldKeyPrefix
+	-- Nếu không có prefix thì dùng storeName gốc / oldStoreName
+	-- Tất cả đều lowercase để tránh miss do hoa/thường
+	local base   = (prefix and prefix ~= "") and prefix:lower()
+		or (config.oldStoreName and config.oldStoreName ~= "" and config.oldStoreName:lower())
+		or config.storeName:lower()
+
+	local uid    = tostring(player.UserId)
+	local name   = player.Name:lower()
+	local seed   = config.oldKeySeed or config.keySeed or "DEFAULT_SEED"
+	local hash   = _makeHash(seed .. uid)
+
+	local candidates = {}
+	-- id luôn thử trước (deterministic nhất)
+	table.insert(candidates, { key = base .. "_" .. uid,  mode = "id"   })
+	table.insert(candidates, { key = base .. "_" .. name, mode = "name" })
+	table.insert(candidates, { key = base .. "_" .. hash, mode = "seed" })
+	-- Thử userId thuần (không prefix) — cho các store lưu key kiểu "7887054577"
+	table.insert(candidates, { key = uid,  mode = "id_pure"   })
+	table.insert(candidates, { key = name, mode = "name_pure" })
+	return candidates
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: fuzzy-find key trong DataStore
+--
+--  Khi không có oldKeyPrefix và key mới không có data,
+--  dùng ListKeysAsync để quét rồi chấm điểm:
+--    +3  chứa UserId
+--    +2  chứa tên player (case-insensitive)
+--    +1  chứa hash seed
+--  Trả về key có điểm cao nhất (hoặc nil)
+-- ────────────────────────────────────────────
+local function _fuzzyFindKey(store, player, config)
+	local uid    = tostring(player.UserId)
+	local name   = player.Name:lower()
+	local seed   = config.oldKeySeed or config.keySeed or "DEFAULT_SEED"
+	local hash   = _makeHash(seed .. uid)
+
+	local bestKey, bestScore = nil, 0
+
+	local ok, pages = pcall(function()
+		return store:ListKeysAsync()
+	end)
+	if not ok then return nil end
+
+	local function scoreKey(k)
+		local kl = k:lower()
+		local s  = 0
+		if kl:find(uid,   1, true) then s += 3 end
+		if kl:find(name,  1, true) then s += 2 end
+		if kl:find(hash,  1, true) then s += 1 end
+		return s
+	end
+
+	local safety = 0
+	while true do
+		safety += 1
+		if safety > 50 then break end  -- giới hạn 50 page tránh treo
+
+		local pageOk, items = pcall(function() return pages:GetCurrentPage() end)
+		if not pageOk then break end
+
+		for _, item in ipairs(items) do
+			local k = item.KeyName
+			local s = scoreKey(k)
+			if s > bestScore then
+				bestScore = s
+				bestKey   = k
+			end
+		end
+
+		if pages.IsFinished then break end
+		local nextOk = pcall(function() pages:AdvanceToNextPageAsync() end)
+		if not nextOk then break end
+	end
+
+	-- Chỉ trả về nếu ít nhất khớp UserId (điểm >= 3) để tránh nhầm data
+	return bestScore >= 3 and bestKey or nil
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: áp dụng giới hạn min/max
+--  Quy ước:
+--    Max = -1        → không giới hạn trên (infinite)
+--    Max = math.huge → không giới hạn trên (infinite)
+--    Min = -1        → không giới hạn dưới (infinite âm)
+--    Không đặt attr  → không giới hạn (nil)
+-- ────────────────────────────────────────────
+local INF = math.huge
+local function _isInfinite(v)
+	return v == nil or v == -1 or v == INF or v == -INF
+end
+
+local function _clamp(value, fieldMeta)
+	if not fieldMeta then return value end
+	if type(value) ~= "number" then return value end
+	-- clamp min
+	if not _isInfinite(fieldMeta.min) and value < fieldMeta.min then
+		value = fieldMeta.min
+	end
+	-- clamp max
+	if not _isInfinite(fieldMeta.max) and value > fieldMeta.max then
+		value = fieldMeta.max
+	end
+	return value
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: deep copy table
+-- ────────────────────────────────────────────
+local function _deepCopy(t)
+	if type(t) ~= "table" then return t end
+	local copy = {}
+	for k, v in pairs(t) do copy[k] = _deepCopy(v) end
+	return copy
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: merge defaults vào data (điền field còn thiếu)
+-- ────────────────────────────────────────────
+local function _applyDefaults(data, defaults)
+	for k, defaultVal in pairs(defaults) do
+		if data[k] == nil then
+			data[k] = _deepCopy(defaultVal)
+		elseif type(defaultVal) == "table" and type(data[k]) == "table" then
+			_applyDefaults(data[k], defaultVal)
+		end
+	end
+	return data
+end
+
+-- ────────────────────────────────────────────
+--  HELPER: OldData migration
+--  Tìm field cũ (oldName) trong raw data và gán sang field mới
+-- ────────────────────────────────────────────
+local function _migrateOldData(data, meta)
+	for newName, fieldMeta in pairs(meta) do
+		if fieldMeta.oldName and data[newName] == nil then
+			local oldVal = data[fieldMeta.oldName]
+			if oldVal ~= nil then
+				data[newName] = oldVal
+				data[fieldMeta.oldName] = nil  -- xóa key cũ
+				print(string.format("PlayerData: Migrated '%s' → '%s'",
+					fieldMeta.oldName, newName))
+			end
+		end
+		-- đệ quy vào sub-table
+		if fieldMeta.isTable and fieldMeta.subMeta and type(data[newName]) == "table" then
+			_migrateOldData(data[newName], fieldMeta.subMeta)
+		end
+	end
+	return data
+end
+
+-- ════════════════════════════════════════════
+--  BONUS SYSTEM
+--  Công thức: (rawValue + totalFlat) × totalMult
+--  bonusFlat / bonusMult từ schema = bonus cố định (attribute trong Studio)
+--  AddBonus runtime = stack thêm bonus tạm thời (VIP, event, buff...)
+-- ════════════════════════════════════════════
+
+-- Tính tổng bonus từ schema + stack runtime
+local function _calcBonus(rawValue, fieldMeta, stack)
+	if type(rawValue) ~= "number" then return rawValue end
+	local totalFlat = fieldMeta and (fieldMeta.bonusFlat or 0) or 0
+	local totalMult = fieldMeta and (fieldMeta.bonusMult or 1) or 1
+	for _, b in ipairs(stack or {}) do
+		totalFlat += (b.flat or 0)
+		totalMult *= (b.mult or 1)
+	end
+	return (rawValue + totalFlat) * totalMult
+end
+
+-- Helper: lấy fieldMeta theo dot-notation ("stats.kills")
+local function _getFieldMeta(schema, fieldPath)
+	local meta = schema.meta
+	for part in fieldPath:gmatch("[^%.]+") do
+		if not meta then return nil end
+		local node = meta[part]
+		if not node then return nil end
+		if node.isTable then
+			meta = node.subMeta
+		else
+			return node
+		end
+	end
+	return nil
+end
+
+-- ── Thêm bonus runtime vào 1 field (stack được nhiều cái) ──
+function PlayerData:AddBonus(player, storeName, fieldPath, bonusName, flat, mult)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	if not self._bonuses[cacheKey] then self._bonuses[cacheKey] = {} end
+	if not self._bonuses[cacheKey][fieldPath] then self._bonuses[cacheKey][fieldPath] = {} end
+	local stack = self._bonuses[cacheKey][fieldPath]
+	-- Nếu tên bonus đã có → ghi đè
+	for i, b in ipairs(stack) do
+		if b.name == bonusName then
+			stack[i] = { name=bonusName, flat=flat or 0, mult=mult or 1 }
+			print(string.format("[Bonus] ✏️  Cập nhật '%s' trên %s.%s | flat=%s mult=%s",
+				bonusName, storeName, fieldPath, tostring(flat), tostring(mult)))
+			return
+		end
+	end
+	table.insert(stack, { name=bonusName, flat=flat or 0, mult=mult or 1 })
+	print(string.format("[Bonus] ➕ Thêm '%s' vào %s.%s | flat=%s mult=%s",
+		bonusName, storeName, fieldPath, tostring(flat), tostring(mult)))
+end
+
+-- ── Xóa 1 bonus cụ thể ──
+function PlayerData:RemoveBonus(player, storeName, fieldPath, bonusName)
+	local uid   = tostring(player.UserId)
+	local stack = self._bonuses[uid.."_"..storeName]
+		and self._bonuses[uid.."_"..storeName][fieldPath]
+	if not stack then return end
+	for i, b in ipairs(stack) do
+		if b.name == bonusName then
+			table.remove(stack, i)
+			print(string.format("[Bonus] ➖ Xóa '%s' khỏi %s.%s", bonusName, storeName, fieldPath))
+			return
+		end
+	end
+end
+
+-- ── Xóa toàn bộ bonus của 1 field ──
+function PlayerData:ClearBonus(player, storeName, fieldPath)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	if self._bonuses[cacheKey] then
+		self._bonuses[cacheKey][fieldPath] = nil
+		print(string.format("[Bonus] 🗑️  Clear bonus của %s.%s", storeName, fieldPath))
+	end
+end
+
+-- ── Lấy danh sách bonus hiện tại của 1 field ──
+function PlayerData:GetBonusList(player, storeName, fieldPath)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	return (self._bonuses[cacheKey] and self._bonuses[cacheKey][fieldPath]) or {}
+end
+
+-- ── Get giá trị đã tính bonus: (raw + flat) × mult ──
+function PlayerData:GetWithBonus(player, storeName, fieldPath)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local schema   = self._schemas[storeName]
+	if not cached or not schema then return nil end
+	-- Lấy raw value qua dot-notation
+	local raw = cached.data
+	for part in fieldPath:gmatch("[^%.]+") do
+		if type(raw) ~= "table" then return nil end
+		raw = raw[part]
+	end
+	local fieldMeta = _getFieldMeta(schema, fieldPath)
+	local stack     = self._bonuses[cacheKey] and self._bonuses[cacheKey][fieldPath] or {}
+	return _calcBonus(raw, fieldMeta, stack)
+end
+
+-- ── In toàn bộ bonus của player ra Output ──
+function PlayerData:PrintBonuses(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local schema   = self._schemas[storeName]
+	print("══════════════════════════════════════")
+	print(string.format("[Bonus] 📋 %s / %s", player.Name, storeName))
+	-- In bonus cố định từ schema
+	print("  [Schema Bonus — từ Studio Attributes]")
+	if schema then
+		local function printSchemaMeta(meta, prefix)
+			for fieldName, m in pairs(meta) do
+				if m.isTable and m.subMeta then
+					printSchemaMeta(m.subMeta, prefix .. fieldName .. ".")
+				elseif (m.bonusFlat and m.bonusFlat ~= 0) or (m.bonusMult and m.bonusMult ~= 1) then
+					print(string.format("    • %-25s BonusFlat=%-6s BonusMult=%s",
+						prefix .. fieldName,
+						tostring(m.bonusFlat or 0),
+						tostring(m.bonusMult or 1)))
+				end
+			end
+		end
+		printSchemaMeta(schema.meta, "")
+	end
+	-- In bonus runtime
+	print("  [Runtime Bonus — AddBonus()]")
+	local all = self._bonuses[cacheKey]
+	if not all or next(all) == nil then
+		print("    (không có bonus runtime nào)")
+	else
+		for fieldPath, stack in pairs(all) do
+			print("    Field: " .. fieldPath)
+			for _, b in ipairs(stack) do
+				print(string.format("      • %-20s flat=%-6s mult=%s",
+					b.name, tostring(b.flat), tostring(b.mult)))
+			end
+		end
+	end
+	print("══════════════════════════════════════")
+end
+
+-- ────────────────────────────────────────────
+--  SCAN FOLDER "DataStore" TRONG SCRIPT
+--  Case-insensitive, tìm trong script hiện tại
+-- ────────────────────────────────────────────
+local function _findDataStoreFolder(script)
+	for _, child in ipairs(script:GetChildren()) do
+		if child:IsA("Folder") and child.Name:lower() == "datastore" then
+			return child
+		end
+	end
+	return nil
+end
+
+local function _scanDataStoreFolders(script)
+	local results = {}
+	-- Tìm tất cả folder tên "datastore" (có thể có nhiều cái)
+	for _, child in ipairs(script:GetDescendants()) do
+		if child:IsA("Folder") and child.Name:lower() == "datastore" then
+			table.insert(results, child)
+		end
+	end
+	return results
+end
+
+-- ────────────────────────────────────────────
+--  ĐĂNG KÝ DATASTORE TỪ FOLDER
+-- ────────────────────────────────────────────
+function PlayerData:RegisterFromFolder(folder)
+	local attrs = _readAttrs(folder)
+
+	local storeName = _getAttr(attrs, "StoreName")
+	if not storeName or storeName == "" then
+		warn("PlayerData: Folder [" .. folder.Name .. "] thiếu attribute StoreName — bỏ qua")
+		return false
+	end
+
+	local config = {
+		storeName     = storeName,
+		keyMode       = _getAttr(attrs, "KeyMode")       or "id",
+		keySeed       = _getAttr(attrs, "KeySeed")       or "DEFAULT_SEED",
+		allowId       = _getAttr(attrs, "AllowId")       ~= false,  -- mặc định true
+		allowName     = _getAttr(attrs, "AllowName")     ~= false,  -- mặc định true
+		allowSeed     = _getAttr(attrs, "AllowSeed")     ~= false,  -- mặc định true
+		autoSave      = _getAttr(attrs, "AutoSave")      ~= false,  -- mặc định true
+		maxHistory    = _getAttr(attrs, "MaxHistory")    or 20,
+		schemaVersion = _getAttr(attrs, "SchemaVersion") or 1,
+		-- Old key migration (đặt qua Attribute trong Studio)
+		-- OldKeyPrefix = "player"      → tìm "player_123456", "player_heroname", "player_<hash>"
+		-- OldStoreName = "PlayerData"  → tìm trong DataStore tên cũ
+		-- OldKeySeed   = "OldSeed"     → seed cũ để tính hash
+		oldKeyPrefix  = (_getAttr(attrs, "OldKeyPrefix") ~= "" and _getAttr(attrs, "OldKeyPrefix")) or nil,
+		oldStoreName  = (_getAttr(attrs, "OldStoreName") ~= "" and _getAttr(attrs, "OldStoreName")) or nil,
+		oldKeySeed    = (_getAttr(attrs, "OldKeySeed")   ~= "" and _getAttr(attrs, "OldKeySeed"))   or nil,
+	}
+
+	-- Đọc schema (defaults + meta) từ children của folder
+	local defaults, meta = _readSchema(folder)
+
+	self._configs[storeName] = config
+	self._schemas[storeName] = { defaults = defaults, meta = meta }
+
+	-- Tạo hoặc lấy DataStore
+	local ok, store = pcall(function()
+		return DataStoreService:GetDataStore(storeName)
+	end)
+	if not ok then
+		warn("PlayerData: Không tạo được DataStore [" .. storeName .. "]"); return false
+	end
+	self._stores[storeName] = store
+
+	print(string.format(
+		"PlayerData: Đã đăng ký store [%s] | KeyMode=%s | %d fields",
+		storeName, config.keyMode, (function()
+			local n = 0
+			for _ in pairs(defaults) do n += 1 end
+			return n
+		end)()
+		))
+	return true
+end
+
+-- ────────────────────────────────────────────
+--  LOAD DATA PLAYER
+-- ────────────────────────────────────────────
+function PlayerData:Load(player, storeName)
+	local config  = self._configs[storeName]
+	local schema  = self._schemas[storeName]
+	local store   = self._stores[storeName]
+
+	if not config or not schema or not store then
+		warn("PlayerData:Load — store chưa được đăng ký: " .. tostring(storeName))
+		return nil
+	end
+
+	local key = PlayerData._buildKey(config, player)
+	if not key then return nil end
+
+	local uid       = tostring(player.UserId)
+	local cacheKey  = uid .. "_" .. storeName
+
+	-- Load từ DataStore (key mới)
+	local ok, raw = pcall(function()
+		return store:GetAsync(key)
+	end)
+
+	-- ════════════════════════════════════════════
+	--  TÌM DATA CŨ (song song với data mới)
+	--  - Nếu data mới KHÔNG có → tự động migrate
+	--  - Nếu data mới ĐÃ CÓ   → lưu tạm vào _pendingMigration, chờ player xác nhận
+	-- ════════════════════════════════════════════
+	local migratedFromOldKey = nil
+
+	if config.oldKeyPrefix or config.oldStoreName or config.oldKeySeed then
+
+		-- Xác định store cần tìm (có thể khác storeName)
+		local oldStore = store
+		if config.oldStoreName and config.oldStoreName ~= storeName then
+			local sok, s = pcall(function()
+				return DataStoreService:GetDataStore(config.oldStoreName)
+			end)
+			if sok then oldStore = s end
+		end
+
+		local foundKey, foundRaw = nil, nil
+
+		-- ── Bước 1: thử các key sinh từ prefix (nhanh, không tốn quota) ──
+		if config.oldKeyPrefix or config.oldStoreName then
+			local candidates = _buildOldKeys(config, player)
+			for _, c in ipairs(candidates) do
+				local tok, traw = pcall(function() return oldStore:GetAsync(c.key) end)
+				if tok and traw then
+					foundKey = c.key
+					foundRaw = traw
+					print(string.format(
+						"PlayerData: [%s] Key cũ tìm thấy (prefix/%s) '%s'",
+						player.Name, c.mode, c.key))
+					break
+				end
+			end
+		end
+
+		-- ── Bước 2: nếu vẫn không có → fuzzy scan ListKeysAsync ──
+		if not foundRaw then
+			local fuzzyKey = _fuzzyFindKey(oldStore, player, config)
+			if fuzzyKey then
+				local tok, traw = pcall(function() return oldStore:GetAsync(fuzzyKey) end)
+				if tok and traw then
+					foundKey = fuzzyKey
+					foundRaw = traw
+					print(string.format(
+						"PlayerData: [%s] Key cũ tìm thấy (fuzzy) '%s'",
+						player.Name, fuzzyKey))
+				end
+			end
+		end
+
+		-- ── Áp dụng nếu tìm được ──
+		if foundRaw then
+			-- ── Normalize format cũ → mới ──
+			-- Format cũ có thể là:
+			--   1. Flat table   : { Coin=1, CouserCoin=2 }         → bọc vào { data={...} }
+			--   2. playerData   : { playerData={...}, lastSaved=N } → đổi key thành data
+			--   3. Format mới   : { data={...}, savedAt=N }         → giữ nguyên
+			if type(foundRaw) == "table" and type(foundRaw.data) ~= "table" then
+				if type(foundRaw.playerData) == "table" then
+					foundRaw = {
+						data    = foundRaw.playerData,
+						savedAt = foundRaw.lastSaved or 0,
+					}
+					print(string.format(
+						"PlayerData: [%s] Normalize 'playerData' → 'data'", player.Name))
+				else
+					-- Flat table: lọc bỏ meta keys, bọc vào data
+					local flat = {}
+					local metaKeys = { lastSaved=true, savedAt=true, savedBy=true,
+						version=true, schemaVersion=true, playerName=true, userId=true }
+					for k, v in pairs(foundRaw) do
+						if not metaKeys[k] then flat[k] = v end
+					end
+					foundRaw = {
+						data    = flat,
+						savedAt = foundRaw.lastSaved or foundRaw.savedAt or 0,
+					}
+					print(string.format(
+						"PlayerData: [%s] Normalize flat table → 'data'", player.Name))
+				end
+			end
+
+			if not ok or not raw then
+				-- Data mới KHÔNG có → auto migrate
+				ok  = true
+				raw = foundRaw
+				migratedFromOldKey = foundKey
+				if config.oldStoreName and config.oldStoreName ~= storeName then
+					pcall(function() oldStore:RemoveAsync(foundKey) end)
+				end
+				print(string.format(
+					"PlayerData: [%s] Auto-migrate từ key cũ '%s' → '%s'",
+					player.Name, foundKey, key))
+			else
+				-- Data mới ĐÃ CÓ → lưu tạm, chờ player xác nhận qua ConfirmMigration()
+				local pmKey = tostring(player.UserId) .. "_" .. storeName
+				PlayerData._pendingMigration[pmKey] = {
+					oldData    = foundRaw,  -- đã normalize rồi
+					oldKey     = foundKey,
+					oldStore   = config.oldStoreName or storeName,
+					detectedAt = os.time(),
+				}
+				print(string.format(
+					"PlayerData: [%s] Data cũ '%s' tìm thấy — chờ player xác nhận migration",
+					player.Name, foundKey))
+			end
+		else
+			if config.oldKeyPrefix or config.oldStoreName then
+				warn(string.format(
+					"PlayerData: [%s] Không tìm được key cũ nào cho store '%s'",
+					player.Name, storeName))
+			end
+		end
+	end
+	-- ════════════════════════════════════════════
+
+	local data
+	if ok and raw and type(raw.data) == "table" then
+		data = raw.data
+		-- Migration OldData (field rename)
+		_migrateOldData(data, schema.meta)
+		-- Điền field còn thiếu theo schema mới
+		_applyDefaults(data, schema.defaults)
+		if migratedFromOldKey then
+			-- Đánh dấu dirty để save ngay với key mới
+			PlayerData._dirty[cacheKey] = true
+		end
+
+		-- ── Kiểm tra ResetAfter và ExpireAt cho từng field ──
+		local savedAt = raw.savedAt or 0
+		local now     = os.time()
+		local needDirty = false
+
+		local function _checkFieldExpiry(dataTable, metaTable, pathPrefix)
+			if type(metaTable) ~= "table" then return end
+			for fieldName, fMeta in pairs(metaTable) do
+				if fMeta.isTable and fMeta.subMeta then
+					-- Sub-table: đệ quy
+					if type(dataTable[fieldName]) == "table" then
+						_checkFieldExpiry(dataTable[fieldName], fMeta.subMeta,
+							pathPrefix .. fieldName .. ".")
+					end
+				else
+					-- ── ExpireAt: field hết hạn tại timestamp cố định ──
+					if fMeta.expireAtTs and now >= fMeta.expireAtTs then
+						if dataTable[fieldName] ~= nil then
+							dataTable[fieldName] = nil
+							needDirty = true
+							print(string.format("[ExpireAt] '%s%s' đã hết hạn (%s) → nil",
+								pathPrefix, fieldName,
+								os.date("%d/%m/%Y %H:%M", fMeta.expireAtTs)))
+						end
+
+						-- ── ResetAfter: field reset về default sau N giây kể từ savedAt ──
+					elseif fMeta.resetAfterSecs and savedAt > 0 then
+						local age = now - savedAt
+						if age >= fMeta.resetAfterSecs then
+							local def = fMeta.default
+							if dataTable[fieldName] ~= def then
+								dataTable[fieldName] = _deepCopy(def)
+								needDirty = true
+								print(string.format(
+									"[ResetAfter] '%s%s' đã %ds (limit %ds) → reset về default",
+									pathPrefix, fieldName,
+									age, fMeta.resetAfterSecs))
+							end
+						end
+					end
+				end
+			end
+		end
+
+		_checkFieldExpiry(data, schema.meta, "")
+		if needDirty then
+			PlayerData._dirty[cacheKey] = true
+		end
+	else
+		if not ok then
+			warn("PlayerData:Load failed — " .. tostring(raw))
+		end
+		-- Tạo data mới từ defaults
+		data = _deepCopy(schema.defaults)
+		print("PlayerData: Tạo data mới cho " .. player.Name .. " / " .. storeName)
+	end
+
+	-- Lưu cache
+	self._cache[cacheKey] = {
+		data      = data,
+		key       = key,
+		storeName = storeName,
+		userId    = player.UserId,
+		name      = player.Name,
+		loadedAt  = os.time(),
+		version   = (ok and raw and raw.version) or 0,
+	}
+
+	return data
+end
+
+-- ────────────────────────────────────────────
+--  SAVE DATA PLAYER
+-- ────────────────────────────────────────────
+function PlayerData:Save(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local store    = self._stores[storeName]
+	local config   = self._configs[storeName]
+
+	if not cached or not store or not config then
+		warn("PlayerData:Save — không có cache cho " .. player.Name .. " / " .. storeName)
+		return false
+	end
+
+	local newVersion = (cached.version or 0) + 1
+	local now        = os.time()
+
+	local payload = {
+		data          = cached.data,
+		version       = newVersion,
+		savedAt       = now,
+		savedBy       = SERVER_ID,
+		schemaVersion = config.schemaVersion,
+		playerName    = player.Name,
+		userId        = player.UserId,
+	}
+
+	local ok, err = pcall(function()
+		store:SetAsync(cached.key, payload)
+	end)
+
+	if ok then
+		cached.version = newVersion
+		self._dirty[cacheKey] = nil
+		-- Lưu audit log
+		PlayerData:_pushAudit(player, storeName, "SAVE", {
+			version = newVersion, savedAt = now
+		})
+		print(string.format("PlayerData: Saved [%s] v%d", storeName, newVersion))
+		return true
+	else
+		warn("PlayerData:Save failed — " .. tostring(err))
+		return false
+	end
+end
+
+-- ────────────────────────────────────────────
+--  GET / SET / INCREMENT / DECREMENT field
+-- ────────────────────────────────────────────
+function PlayerData:Get(player, storeName, fieldPath)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	if not cached then return nil end
+
+	-- fieldPath có thể là "coins" hoặc "stats.kills" (dot-notation)
+	local data = cached.data
+	for part in fieldPath:gmatch("[^%.]+") do
+		if type(data) ~= "table" then return nil end
+		data = data[part]
+	end
+	return data
+end
+
+function PlayerData:Set(player, storeName, fieldPath, value)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local schema   = self._schemas[storeName]
+	if not cached or not schema then return false end
+
+	-- Tìm meta để clamp và check readOnly
+	local parts  = {}
+	for part in fieldPath:gmatch("[^%.]+") do table.insert(parts, part) end
+	local fieldMeta = schema.meta
+	for i, part in ipairs(parts) do
+		if i == #parts then
+			fieldMeta = fieldMeta and fieldMeta[part] or nil
+		else
+			fieldMeta = fieldMeta and fieldMeta[part] and fieldMeta[part].subMeta or nil
+		end
+	end
+
+	if fieldMeta and fieldMeta.readOnly then
+		warn("PlayerData:Set — field '" .. fieldPath .. "' là readOnly"); return false
+	end
+
+	-- Clamp nếu là number
+	value = _clamp(value, fieldMeta)
+
+	-- Ghi vào data
+	local data = cached.data
+	for i, part in ipairs(parts) do
+		if i == #parts then
+			local old = data[part]
+			data[part] = value
+			-- Ghi audit
+			PlayerData:_pushAudit(player, storeName, "SET", {
+				field = fieldPath, old = old, new = value
+			})
+		else
+			if type(data[part]) ~= "table" then data[part] = {} end
+			data = data[part]
+		end
+	end
+
+	-- AutoSave per-field: nếu fieldMeta.autoSave == false thì không đánh dirty
+	-- nil hoặc true → vẫn auto-save bình thường (kế thừa config store)
+	local storeConfig   = self._configs[storeName]
+	local storeAutoSave = not (storeConfig and storeConfig.autoSave == false)
+	local shouldDirty
+	if fieldMeta ~= nil and fieldMeta.autoSave ~= nil then
+		shouldDirty = fieldMeta.autoSave ~= false  -- override từ Value object
+	else
+		shouldDirty = storeAutoSave                -- kế thừa store
+	end
+	if shouldDirty then
+		self._dirty[cacheKey] = true
+	end
+	return true
+end
+
+function PlayerData:Increment(player, storeName, fieldPath, amount)
+	amount = amount or 1
+	local current = PlayerData:Get(player, storeName, fieldPath)
+	if type(current) ~= "number" then
+		warn("PlayerData:Increment — field '" .. fieldPath .. "' không phải number")
+		return false
+	end
+	return PlayerData:Set(player, storeName, fieldPath, current + amount)
+end
+
+function PlayerData:Decrement(player, storeName, fieldPath, amount)
+	amount = amount or 1
+	return PlayerData:Increment(player, storeName, fieldPath, -amount)
+end
+
+-- Toggle boolean
+function PlayerData:Toggle(player, storeName, fieldPath)
+	local current = PlayerData:Get(player, storeName, fieldPath)
+	if type(current) ~= "boolean" then
+		warn("PlayerData:Toggle — field '" .. fieldPath .. "' không phải boolean")
+		return false
+	end
+	return PlayerData:Set(player, storeName, fieldPath, not current)
+end
+
+-- Lấy toàn bộ data của player
+function PlayerData:GetAll(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	return cached and _deepCopy(cached.data) or nil
+end
+
+-- Reset về defaults
+function PlayerData:Reset(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local schema   = self._schemas[storeName]
+	if not cached or not schema then return false end
+	cached.data = _deepCopy(schema.defaults)
+	self._dirty[cacheKey] = true
+	PlayerData:_pushAudit(player, storeName, "RESET", {})
+	return true
+end
+
+-- Xóa data khỏi DataStore (GDPR / wipe)
+function PlayerData:Wipe(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local store    = self._stores[storeName]
+	if not cached or not store then return false end
+	local ok, err = pcall(function()
+		store:RemoveAsync(cached.key)
+	end)
+	if ok then
+		self._cache[cacheKey] = nil
+		self._dirty[cacheKey] = nil
+		print("PlayerData: Wiped data cho " .. player.Name .. " / " .. storeName)
+		return true
+	else
+		warn("PlayerData:Wipe failed — " .. tostring(err))
+		return false
+	end
+end
+
+-- ────────────────────────────────────────────
+--  HISTORY & AUDIT LOG
+-- ────────────────────────────────────────────
+
+-- Lưu audit entry (nội bộ)
+function PlayerData:_pushAudit(player, storeName, action, detail)
+	local uid       = tostring(player.UserId)
+	local auditKey  = "Audit_" .. uid .. "_" .. storeName
+	task.spawn(function()
+		pcall(function()
+			AuditLogStore:UpdateAsync(auditKey, function(old)
+				local log    = old or { entries = {}, userId = player.UserId, name = player.Name }
+				local config = PlayerData._configs[storeName]
+				local schema = PlayerData._schemas[storeName]
+				-- MaxHistory: ưu tiên fieldMeta override (nếu action=SET và có field path)
+				local maxH = config and config.maxHistory or 20
+				if detail and detail.field and schema then
+					local fMeta = _getFieldMeta(schema, detail.field)
+					if fMeta and fMeta.maxHistory ~= nil then
+						maxH = fMeta.maxHistory  -- math.huge nếu user đặt -1
+					end
+				end
+				table.insert(log.entries, {
+					action    = action,
+					detail    = detail,
+					time      = os.time(),
+					serverId  = SERVER_ID,
+					storeName = storeName,
+				})
+				-- cắt bớt nếu vượt maxHistory
+				while #log.entries > maxH do
+					table.remove(log.entries, 1)
+				end
+				return log
+			end)
+		end)
+	end)
+end
+
+-- Lấy lịch sử thay đổi của player (audit log)
+function PlayerData:GetHistory(player, storeName)
+	local uid      = tostring(player.UserId)
+	local auditKey = "Audit_" .. uid .. "_" .. storeName
+	local ok, log  = pcall(function()
+		return AuditLogStore:GetAsync(auditKey)
+	end)
+	if ok and log then return log.entries or {} end
+	return {}
+end
+
+-- Lấy version hiện tại
+function PlayerData:GetVersion(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	return cached and cached.version or nil
+end
+
+-- Xem data tại version cũ (dùng DataStore VersionHistory nếu game bật)
+function PlayerData:GetVersionedData(player, storeName, timestamp)
+	local uid    = tostring(player.UserId)
+	local config = self._configs[storeName]
+	local store  = self._stores[storeName]
+	if not config or not store then return nil end
+	local key = PlayerData._buildKey(config, player)
+	local ok, pages = pcall(function()
+		return store:ListVersionsAsync(key, nil, nil, timestamp, timestamp, 1)
+	end)
+	if not ok then
+		warn("PlayerData:GetVersionedData failed — " .. tostring(pages))
+		return nil
+	end
+	local items = pages:GetCurrentPage()
+	if #items == 0 then return nil end
+	local vOk, vData = pcall(function()
+		return store:GetVersionAsync(key, items[1].Version)
+	end)
+	return vOk and vData or nil
+end
+
+-- ────────────────────────────────────────────
+--  CHECK DATA
+-- ────────────────────────────────────────────
+
+-- Kiểm tra player đã load data chưa
+function PlayerData:IsLoaded(player, storeName)
+	local uid = tostring(player.UserId)
+	return self._cache[uid .. "_" .. storeName] ~= nil
+end
+
+-- Lấy thống kê cache
+function PlayerData:GetCacheInfo(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	if not cached then return nil end
+	return {
+		key       = cached.key,
+		storeName = cached.storeName,
+		version   = cached.version,
+		loadedAt  = cached.loadedAt,
+		isDirty   = self._dirty[cacheKey] == true,
+	}
+end
+
+-- ────────────────────────────────────────────
+--  EXPIRY INFO — đọc trạng thái reset/expire của 1 field
+-- ────────────────────────────────────────────
+
+-- Trả về bảng thông tin thời hạn của 1 field:
+--   { type, secondsLeft, expireAt, resetAfterSecs, isExpired, willReset }
+-- type = "expireAt" | "resetAfter" | nil
+function PlayerData:GetFieldExpiryInfo(player, storeName, fieldPath)
+	local schema = self._schemas[storeName]
+	if not schema then return nil end
+	local fMeta = _getFieldMeta(schema, fieldPath)
+	if not fMeta then return nil end
+
+	local now    = os.time()
+	local result = { fieldPath = fieldPath }
+
+	-- ExpireAt
+	if fMeta.expireAtTs then
+		result.type        = "expireAt"
+		result.expireAt    = fMeta.expireAtTs
+		result.expireAtStr = os.date("%d/%m/%Y %H:%M", fMeta.expireAtTs)
+		result.secondsLeft = math.max(0, fMeta.expireAtTs - now)
+		result.isExpired   = now >= fMeta.expireAtTs
+	end
+
+	-- ResetAfter (kết hợp được với ExpireAt — hiển thị cả 2)
+	if fMeta.resetAfterSecs then
+		local uid      = tostring(player.UserId)
+		local cached   = self._cache[uid .. "_" .. storeName]
+		local savedAt  = cached and cached.savedAt or 0
+		local age      = savedAt > 0 and (now - savedAt) or 0
+		local left     = math.max(0, fMeta.resetAfterSecs - age)
+		result.resetType        = "resetAfter"
+		result.resetAfterSecs   = fMeta.resetAfterSecs
+		result.resetSecondsLeft = left
+		result.willReset        = age >= fMeta.resetAfterSecs
+		if not result.type then result.type = "resetAfter" end
+	end
+
+	return result
+end
+
+-- Chạy lại kiểm tra reset/expire cho tất cả field của player ngay lập tức
+-- (bình thường chỉ chạy khi Load — dùng cái này để force check giữa session)
+function PlayerData:ForceCheckExpiry(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = self._cache[cacheKey]
+	local schema   = self._schemas[storeName]
+	if not cached or not schema then return false end
+
+	local now      = os.time()
+	local savedAt  = cached.savedAt or 0
+	local dirty    = false
+
+	local function _check(dataTable, metaTable, pathPrefix)
+		if type(metaTable) ~= "table" then return end
+		for fieldName, fMeta in pairs(metaTable) do
+			if fMeta.isTable and fMeta.subMeta then
+				if type(dataTable[fieldName]) == "table" then
+					_check(dataTable[fieldName], fMeta.subMeta, pathPrefix .. fieldName .. ".")
+				end
+			else
+				if fMeta.expireAtTs and now >= fMeta.expireAtTs then
+					if dataTable[fieldName] ~= nil then
+						dataTable[fieldName] = nil
+						dirty = true
+						print(string.format("[ForceExpiry] '%s%s' hết hạn → nil", pathPrefix, fieldName))
+					end
+				elseif fMeta.resetAfterSecs and savedAt > 0 then
+					local age = now - savedAt
+					if age >= fMeta.resetAfterSecs then
+						local def = fMeta.default
+						if dataTable[fieldName] ~= def then
+							dataTable[fieldName] = _deepCopy(def)
+							dirty = true
+							print(string.format("[ForceReset] '%s%s' reset → default", pathPrefix, fieldName))
+						end
+					end
+				end
+			end
+		end
+	end
+
+	_check(cached.data, schema.meta, "")
+	if dirty then PlayerData._dirty[cacheKey] = true end
+	return dirty
+end
+
+-- ════════════════════════════════════════════
+--  INLINE CONFIG — setup ngay trong script
+--  (không cần folder trong Studio)
+--
+--  Cách dùng:
+--    1. Sửa PLAYER_STORES bên dưới
+--    2. Mỗi entry là 1 DataStore với schema đầy đủ
+--    3. Chạy game → tự đăng ký, tự load/save cho player
+--
+--  Cú pháp field:
+--    fieldName = { default=<giá trị>, min=<số/-1>, max=<số/-1>, oldName="<tênCũ>", readOnly=<bool> }
+--
+--  Sub-table:
+--    inventory = { _isTable=true, sword={default=false}, shield={default=false} }
+--
+--  Giá trị min/max:
+--    số cụ thể   → giới hạn thật
+--    -1          → không giới hạn (infinite)
+--    bỏ trống    → không giới hạn (nil)
+-- ════════════════════════════════════════════
+
+local PLAYER_STORES = {
+
+	-- ── Store 1: Data chính của player ──────────────────────────
+	{
+		-- Cấu hình store
+		config = {
+			storeName     = "CoursePlayer",  -- tên DataStore thật trên Roblox
+			keyMode       = "id",             -- "id" | "name" | "seed"
+			keySeed       = "MyGame2025",     -- chỉ dùng khi keyMode = "seed"
+			allowId       = true,             -- bật key dạng UserId
+			allowName     = true,             -- bật key dạng tên player
+			allowSeed     = true,             -- bật key dạng seed hash
+			autoSave      = true,             -- tự save mỗi 60s
+			maxHistory    = 30,               -- số entry audit giữ lại
+			schemaVersion = 1,
+		},
+
+		-- Schema: định nghĩa từng field
+		-- default = giá trị mặc định khi player mới
+		-- min/max = giới hạn (-1 = không giới hạn / bỏ trống = không giới hạn)
+		-- oldName = tên field CŨ trong DataStore (tự migrate sang tên mới)
+		-- readOnly= true → không cho Set từ bên ngoài
+		schema = {
+			defaults = {
+				coins      = 0,
+				gems       = 0,
+				level      = 1,
+				exp        = 0,
+				username   = "",
+				isPremium  = false,
+				totalKills = 0,
+				tradePin   = "",  -- secret: không ai xem được kể cả bản thân
+				stats = {
+					kills  = 0,
+					deaths = 0,
+					wins   = 0,
+				},
+				inventory = {
+					sword  = false,
+					shield = false,
+					bow    = false,
+				},
+			},
+			meta = {
+				coins      = { default=0,     min=0,   max=-1,  oldName=nil,          readOnly=false, visibility="public"  },
+				gems       = { default=0,     min=0,   max=-1,  oldName="diamonds",   readOnly=false, visibility="public"  },
+				level      = { default=1,     min=1,   max=100, oldName=nil,          readOnly=false, visibility="public"  },
+				exp        = { default=0,     min=0,   max=-1,  oldName="experience", readOnly=false, visibility="private" },  -- chỉ bản thân xem
+				username   = { default="",    min=nil, max=nil, oldName="playerName", readOnly=true,  visibility="public"  },
+				isPremium  = { default=false, min=nil, max=nil, oldName=nil,          readOnly=false, visibility="private" },  -- chỉ bản thân xem
+				totalKills = { default=0,     min=0,   max=-1,  oldName="kills",      readOnly=false, visibility="public"  },
+				tradePin   = { default="",    min=nil, max=nil, oldName=nil,          readOnly=false, visibility="secret"  },  -- không ai xem kể cả bản thân
+				stats = {
+					isTable = true,
+					subMeta = {
+						kills  = { default=0, min=0, max=-1, oldName=nil, readOnly=false, visibility="public"  },
+						deaths = { default=0, min=0, max=-1, oldName=nil, readOnly=false, visibility="public"  },
+						wins   = { default=0, min=0, max=-1, oldName=nil, readOnly=false, visibility="public"  },
+					},
+				},
+				inventory = {
+					isTable = true,
+					subMeta = {
+						sword  = { default=false, readOnly=false, visibility="private" },  -- chỉ bản thân xem
+						shield = { default=false, readOnly=false, visibility="private" },
+						bow    = { default=false, readOnly=false, visibility="private" },
+					},
+				},
+			},
+		},
+	},
+
+	-- ── Store 2: Leaderboard / ranking riêng ────────────────────
+	-- (Bỏ comment để bật)
+	--[[
+	{
+		config = {
+			storeName     = "LeaderData_v1",
+			keyMode       = "id",
+			autoSave      = true,
+			maxHistory    = 10,
+			schemaVersion = 1,
+		},
+		schema = {
+			defaults = {
+				totalScore = 0,
+				rank       = 0,
+				badge      = "none",
+			},
+			meta = {
+				totalScore = { default=0,      min=0, max=-1,  oldName="score", readOnly=false },
+				rank       = { default=0,      min=0, max=-1,  oldName=nil,     readOnly=true  },
+				badge      = { default="none", min=nil,max=nil,oldName=nil,     readOnly=false },
+			},
+		},
+	},
+	--]]
+
+}
+
+-- ────────────────────────────────────────────
+--  AUTO SCAN KHI KHỞI ĐỘNG
+-- ────────────────────────────────────────────
+local function _autoScanScript()
+	-- Tìm script hiện tại (ModuleScript hoặc Script)
+	local script = script
+	local folders = _scanDataStoreFolders(script)
+
+	if #folders == 0 then
+		print("PlayerData: Không tìm thấy folder 'DataStore' trong script — bỏ qua auto-scan")
+		return
+	end
+
+	for _, folder in ipairs(folders) do
+		print("PlayerData: Tìm thấy folder DataStore — " .. folder:GetFullName())
+		-- Scan folder CON bên trong DataStore, mỗi folder con là 1 store riêng
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				PlayerData:RegisterFromFolder(child)
+			end
+		end
+	end
+end
+
+-- ────────────────────────────────────────────
+--  AUTO SAVE LOOP
+-- ────────────────────────────────────────────
+task.spawn(function()
+	task.wait(10)  -- chờ server ổn định
+	while true do
+		task.wait(60)  -- auto save mỗi 60 giây
+		for cacheKey, isDirty in pairs(PlayerData._dirty) do
+			if isDirty then
+				-- parse uid và storeName từ cacheKey
+				local uid, storeName = cacheKey:match("^(%d+)_(.+)$")
+				if uid and storeName then
+					local player = Players:GetPlayerByUserId(tonumber(uid))
+					if player then
+						PlayerData:Save(player, storeName)
+					else
+						-- Player đã rời — xóa dirty flag
+						PlayerData._dirty[cacheKey] = nil
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ════════════════════════════════════════════
+--  DATA CONFIG — ĐỌC TỪ FOLDER TRONG STUDIO
+-- ════════════════════════════════════════════
+
+local DataConfig = {}
+DataConfig._loaded = false
+
+local function readValueObject(obj)
+	return _readVal(obj)
+end
+
+local function readAttributes(inst)
+	return _readAttrs(inst)
+end
+
+local function readPayloadFolder(folder)
+	local payload = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		local v = readValueObject(child)
+		if v ~= nil then
+			payload[child.Name] = v
+		elseif child:IsA("Folder") then
+			payload[child.Name] = readPayloadFolder(child)
+		end
+	end
+	for k, v in pairs(readAttributes(folder)) do
+		if payload[k] == nil then payload[k] = v end
+	end
+	return payload
+end
+
+local function loadRandomPools(poolsFolder)
+	local attrs    = readAttributes(poolsFolder)
+	local autoLoad = attrs.AutoLoad == true
+
+	for _, poolFolder in ipairs(poolsFolder:GetChildren()) do
+		if not poolFolder:IsA("Folder") then continue end
+		local pa     = readAttributes(poolFolder)
+		local mode   = pa.mode or "list"
+		local config = { mode=mode }
+
+		if mode == "weighted" or mode == "list" then
+			local items = {}
+			for _, itemObj in ipairs(poolFolder:GetChildren()) do
+				local val = readValueObject(itemObj)
+				if val ~= nil then
+					local ia = readAttributes(itemObj)
+					table.insert(items, { value=val, weight=ia.weight or 1, tier=ia.tier, extra=ia })
+				end
+			end
+			config.items = items
+
+		elseif mode == "range" then
+			config.min = pa.min or 0; config.max = pa.max or 100; config.isFloat = pa.isFloat or false
+
+		elseif mode == "seeded" then
+			config.seed = pa.seed or poolFolder.Name; config.seedMode = pa.seedMode or "list"
+			local items = {}
+			for _, itemObj in ipairs(poolFolder:GetChildren()) do
+				local val = readValueObject(itemObj)
+				if val ~= nil then table.insert(items, val) end
+			end
+			config.args = { items }
+
+		elseif mode == "bonusStack" then
+			config.base = { min=pa.baseMin or 0, max=pa.baseMax or 10, isFloat=pa.baseFloat or false }
+			config.bonuses = {}
+			local bonusFolder = poolFolder:FindFirstChild("Bonuses")
+			if bonusFolder then
+				for _, bObj in ipairs(bonusFolder:GetChildren()) do
+					local ba    = readAttributes(bObj)
+					local bonus = { name=bObj.Name }
+					if bObj:IsA("NumberValue") then bonus.value = bObj.Value
+					elseif ba.min and ba.max then
+						bonus.min = ba.min; bonus.max = ba.max; bonus.isFloat = ba.isFloat
+					elseif ba.weighted then
+						bonus.weighted = true; bonus.items = {}
+						for _, wi in ipairs(bObj:GetChildren()) do
+							local wv = readValueObject(wi)
+							if wv ~= nil then
+								local wa = readAttributes(wi)
+								table.insert(bonus.items, { value=wv, weight=wa.weight or 1 })
+							end
+						end
+					end
+					table.insert(config.bonuses, bonus)
+				end
+			end
+		end
+
+		if autoLoad then RandomData:RegisterPool(poolFolder.Name, config) end
+		print("DataConfig: RandomPool loaded — " .. poolFolder.Name .. " [" .. mode .. "]")
+	end
+end
+
+local function loadScheduledEvents(schedFolder)
+	for _, eventFolder in ipairs(schedFolder:GetChildren()) do
+		if not eventFolder:IsA("Folder") then continue end
+		local attrs     = readAttributes(eventFolder)
+		local dataType  = attrs.dataType  or "eventState"
+		local startTime = attrs.startTime
+		local endTime   = attrs.endTime
+
+		if not startTime then
+			warn("DataConfig: ScheduledEvent [" .. eventFolder.Name .. "] thiếu startTime")
+			continue
+		end
+
+		local payloadFolder = eventFolder:FindFirstChild("Payload")
+		local payload       = payloadFolder and readPayloadFolder(payloadFolder) or {}
+		local reserved      = { dataType=true, startTime=true, endTime=true, description=true }
+		for k, v in pairs(attrs) do
+			if not reserved[k] then payload[k] = v end
+		end
+
+		ScheduledData:Register(eventFolder.Name, dataType, payload, startTime, endTime, {
+			description = attrs.description or eventFolder.Name,
+			source      = "DataConfig",
+		})
+	end
+end
+
+local function loadGlobalDefaults(defaultsFolder)
+	for _, obj in ipairs(defaultsFolder:GetChildren()) do
+		local v = readValueObject(obj)
+		if v == nil then continue end
+		local dataType, key = obj.Name:match("^(%w+)_(.+)$")
+		if dataType and key and GLOBAL_TYPES[dataType] then
+			if GlobalData:Get(dataType, key) == nil then
+				GlobalData:Set(dataType, key, v)
+				print("DataConfig: GlobalDefault — " .. obj.Name .. " = " .. tostring(v))
+			end
+		else
+			warn("DataConfig: GlobalDefault tên không hợp lệ — " .. obj.Name)
+		end
+	end
+end
+
+-- ── Phần mới: load PlayerDataStores từ DataConfig folder ──
+local function loadPlayerDataStores(playerDataFolder)
+	for _, storeFolder in ipairs(playerDataFolder:GetChildren()) do
+		if storeFolder:IsA("Folder") then
+			PlayerData:RegisterFromFolder(storeFolder)
+		end
+	end
+end
+
+function DataConfig:Load()
+	if self._loaded then return end
+	-- Tìm folder tên "dataconfig" (case-insensitive) ngay trong script
+	local root
+	for _, child in ipairs(script:GetChildren()) do
+		if child:IsA("Folder") and child.Name:lower() == "dataconfig" then
+			root = child
+			break
+		end
+	end
+	if not root then
+		warn("DataConfig: Không tìm thấy folder 'DataConfig' trong script — bỏ qua"); return
+	end
+	local rootAttrs = readAttributes(root)
+	print("DataConfig: Loading... version=" .. tostring(rootAttrs.Version or "?"))
+
+	for _, categoryFolder in ipairs(root:GetChildren()) do
+		if not categoryFolder:IsA("Folder") then continue end
+		local name = categoryFolder.Name
+		if name == "RandomPools" then
+			loadRandomPools(categoryFolder)
+		elseif name == "ScheduledEvents" then
+			loadScheduledEvents(categoryFolder)
+		elseif name == "GlobalDefaults" then
+			loadGlobalDefaults(categoryFolder)
+		elseif name == "PlayerDataStores" then
+			-- Mới: đăng ký PlayerData stores từ Studio folder
+			loadPlayerDataStores(categoryFolder)
+		else
+			local data = readPayloadFolder(categoryFolder)
+			SessionData:Set("config_" .. name, data)
+			print("DataConfig: Custom folder loaded — " .. name)
+		end
+	end
+
+	self._loaded = true
+	print("DataConfig: Load hoàn tất")
+end
+
+function DataConfig:Reload()
+	self._loaded = false; self:Load()
+end
+
+-- ════════════════════════════════════════════
+--         MESSAGING SUBSCRIPTIONS
+-- ════════════════════════════════════════════
+
+pcall(function()
+	MessagingService:SubscribeAsync("GlobalUpdate", function(msg)
+		local d = msg.Data
+		if d.setBy == SERVER_ID then return end
+		local fk = d.type .. "_" .. d.key
+		if d.op == "increment" then
+			local c = GlobalData._cache[fk]
+			GlobalData._cache[fk] = { value=(c and c.value or 0)+(d.amount or 0), time=os.time() }
+		else
+			GlobalData._cache[fk] = { value=d.value, time=os.time() }
+		end
+	end)
+end)
+
+pcall(function()
+	MessagingService:SubscribeAsync("AdminBroadcast", function(msg)
+		local d = msg.Data
+		for _, p in Players:GetPlayers() do
+			RE_AdminMessage:FireClient(p,{message=d.message,duration=d.duration,sentAt=d.sentAt})
+		end
+	end)
+end)
+
+pcall(function()
+	MessagingService:SubscribeAsync("ScheduledFired", function(msg)
+		local d = msg.Data
+		GlobalData._cache[d.dataType.."_"..d.jobId] = { value=d.payload, time=os.time() }
+		for _, p in Players:GetPlayers() do RE_ScheduledFired:FireClient(p, d) end
+		if ScheduledData._jobs[d.jobId] then
+			ScheduledData._jobs[d.jobId].status  = "active"
+			ScheduledData._jobs[d.jobId].firedAt = d.firedAt
+		end
+	end)
+end)
+
+pcall(function()
+	MessagingService:SubscribeAsync("ScheduledEnded", function(msg)
+		local d = msg.Data
+		if ScheduledData._jobs[d.jobId] then ScheduledData._jobs[d.jobId] = nil end
+	end)
+end)
+
+-- ════════════════════════════════════════════
+--         PLAYER LIFECYCLE
+-- ════════════════════════════════════════════
+
+local function onPlayerAdded(player)
+	SessionData:RegisterPlayer(player, true)
+	GameEventLog:StartSession(player)
+
+	-- [DataSave] Chờ load session data player xong rồi log
+	if DataSave then
+		task.spawn(function()
+			DataSave:WaitForLoad(player, 10)
+			local info = DataSave:GetSessionInfo(player)
+			print(string.format("[Data6] DataSave loaded cho %s (phiên %s)",
+				player.Name, tostring(info and info.sessionNum or "?")))
+		end)
+	end
+
+	-- Load data cho tất cả store đã đăng ký (PlayerData hệ thống cũ)
+	for storeName in pairs(PlayerData._configs) do
+		task.spawn(function()
+			PlayerData:Load(player, storeName)
+		end)
+	end
+
+	local result = ConflictResolver:CheckOnJoin(player)
+	if result.conflict then
+		warn("Conflict: " .. player.Name .. " — " .. result.reason)
+		SessionData:Log("CONFLICT_DETECTED",{
+			player=player.Name, userId=player.UserId,
+			reason=result.reason, timeDiff=result.timeDiff,
+		})
+		SessionData:Set("conflict_"..player.UserId, result)
+	end
+end
+
+local function onPlayerRemoving(player)
+	SessionData:RegisterPlayer(player, false)
+	ConflictResolver:SaveExitStamp(player)
+	GameEventLog:EndSession(player)
+	cleanRateTracker(player)
+
+	-- [DataSave] Save session data player (DataSave.PlayerRemoving đã connect sẵn,
+	-- gọi thêm :Save() ở đây để đảm bảo save trước khi PlayerData bên dưới chạy)
+	if DataSave then
+		DataSave:Save(player)
+	end
+
+	-- Save & xóa cache tất cả store
+	for storeName in pairs(PlayerData._configs) do
+		local uid      = tostring(player.UserId)
+		local cacheKey = uid .. "_" .. storeName
+		if PlayerData._cache[cacheKey] then
+			PlayerData:Save(player, storeName)
+			PlayerData._cache[cacheKey] = nil
+		end
+		-- Dọn bonus cache
+		PlayerData._bonuses[uid .. "_" .. storeName] = nil
+	end
+
+	-- Dọn TTL handles của player (tránh leak)
+	local uid = tostring(player.UserId)
+	for k in pairs(PlayerData._ttlHandles) do
+		if k:sub(1, #uid) == uid then
+			TTLCore:Cancel(PlayerData._ttlHandles[k])
+			PlayerData._ttlHandles[k] = nil
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+for _, p in Players:GetPlayers() do task.spawn(onPlayerAdded, p) end
+
+-- Auto-save snapshot mỗi 60 giây
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for _, player in Players:GetPlayers() do
+			local s = GameEventLog._sessions[tostring(player.UserId)]
+			if s and s.checkpoint then
+				GameEventLog:UpdateSnapshot(player, nil, nil, nil)
+			end
+		end
+	end
+end)
+
+-- ════════════════════════════════════════════
+--         SERVER CLOSE
+-- ════════════════════════════════════════════
+
+game:BindToClose(function()
+	print("ServerDataManager: Closing...")
+
+	-- [DataModule] Save tất cả container đang dirty
+	if DataModule then
+		DataModule:SaveAll()
+		print("[Data6] DataModule:SaveAll() hoàn tất")
+	end
+
+	for _, player in Players:GetPlayers() do
+		GameEventLog:EndSession(player)
+		for storeName in pairs(PlayerData._configs) do
+			PlayerData:Save(player, storeName)
+		end
+	end
+
+	-- Xóa log của server này khỏi DataStore (log server chỉ cần trong phiên, không cần lưu lại)
+	local serverLogKey   = "EventLog_" .. SERVER_ID .. "_" .. tostring(SERVER_START)
+	pcall(function() EventLogStore:RemoveAsync(serverLogKey) end)
+
+	-- Xóa toàn bộ GameEventLog session của server này (Session_<uid>_<SERVER_START>)
+	-- Quét các key theo prefix SERVER_START để xóa đúng server này
+	local sessionPrefix = "Session_"
+	local ok, pages = pcall(function()
+		return GameEventStore:ListKeysAsync(sessionPrefix, 200)
+	end)
+	if ok and pages then
+		local safety = 0
+		while true do
+			safety += 1
+			if safety > 20 then break end
+			local pageOk, items = pcall(function() return pages:GetCurrentPage() end)
+			if not pageOk then break end
+			for _, item in ipairs(items) do
+				-- Key dạng: Session_<uid>_<SERVER_START> — chỉ xóa key của server này
+				if item.KeyName:find(tostring(SERVER_START), 1, true) then
+					pcall(function() GameEventStore:RemoveAsync(item.KeyName) end)
+					print("[ServerClose] Xóa GameEventLog key: " .. item.KeyName)
+				end
+			end
+			if pages.IsFinished then break end
+			pcall(function() pages:AdvanceToNextPageAsync() end)
+		end
+	end
+
+	pcall(function() MemorySession:RemoveAsync("Server_"..SERVER_ID) end)
+	-- SessionData:SaveEventLog() đã bỏ — log server không cần lưu lại
+	print("ServerDataManager: Done")
+end)
+
+pcall(function()
+	MemorySession:SetAsync("Server_"..SERVER_ID,{
+		serverId=SERVER_ID, placeId=SERVER_PLACE,
+		startTime=SERVER_START, playerCount=0,
+	}, 86400)
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(30)
+		pcall(function()
+			MemorySession:UpdateAsync("Server_"..SERVER_ID, function(old)
+				if not old then return nil end
+				old.playerCount = #Players:GetPlayers()
+				old.lastPing    = os.time()
+				return old
+			end, 86400)
+		end)
+	end
+end)
+
+-- ════════════════════════════════════════════
+--  DEAD SERVER LOG CLEANUP
+--  Mỗi 5 phút quét MemorySession, nếu server nào
+--  không ping trong 3 phút → coi là đã chết →
+--  xóa EventLog và GameEventLog của server đó
+-- ════════════════════════════════════════════
+
+task.spawn(function()
+	task.wait(60)  -- chờ ổn định
+	while true do
+		task.wait(300)  -- quét mỗi 5 phút
+		local now = os.time()
+		local ok, pages = pcall(function()
+			return MemorySession:GetRangeAsync(Enum.SortDirection.Ascending, 50)
+		end)
+		if not ok or not pages then continue end
+
+		for _, entry in ipairs(pages) do
+			local info = entry.value
+			if type(info) ~= "table" then continue end
+			-- Server không ping trong 3 phút → coi là đã chết
+			local lastPing = info.lastPing or info.startTime or 0
+			if info.serverId and info.serverId ~= SERVER_ID
+				and (now - lastPing) > 180 then
+
+				local deadId    = info.serverId
+				local deadStart = info.startTime or 0
+
+				-- Xóa ServerEventLog của server chết
+				local evKey = "EventLog_" .. deadId .. "_" .. tostring(deadStart)
+				pcall(function() EventLogStore:RemoveAsync(evKey) end)
+
+				-- Xóa GameEventLog sessions của server chết
+				local sok, spages = pcall(function()
+					return GameEventStore:ListKeysAsync("Session_", 200)
+				end)
+				if sok and spages then
+					local sf = 0
+					while true do
+						sf += 1; if sf > 20 then break end
+						local pok, items = pcall(function() return spages:GetCurrentPage() end)
+						if not pok then break end
+						for _, item in ipairs(items) do
+							if item.KeyName:find(tostring(deadStart), 1, true) then
+								pcall(function() GameEventStore:RemoveAsync(item.KeyName) end)
+								print("[DeadServer] Xóa orphan log: " .. item.KeyName)
+							end
+						end
+						if spages.IsFinished then break end
+						pcall(function() spages:AdvanceToNextPageAsync() end)
+					end
+				end
+
+				-- Xóa record server chết khỏi MemorySession
+				pcall(function() MemorySession:RemoveAsync(entry.key) end)
+				print(string.format("[DeadServer] Cleaned up server %s (lastPing %ds ago)",
+					deadId, now - lastPing))
+			end
+		end
+	end
+end)
+
+-- ════════════════════════════════════════════
+--  GAME PROGRESS SYSTEM
+--  Lưu tiến trình màn chơi của player.
+--  - Gửi lên mỗi khi có sự kiện quan trọng
+--  - Tự xóa khi player hoàn thành màn
+--  - Giữ lại nếu player chưa hoàn thành
+--
+--  Key: "Progress_<userId>_<levelId>"
+-- ════════════════════════════════════════════
+
+local GameProgressStore = DataStoreService:GetDataStore("GameProgress_v1")
+local GameProgress      = {}
+
+-- Lưu tiến trình màn chơi (gọi mỗi khi có checkpoint / sự kiện quan trọng)
+-- levelId  = tên/số màn, ví dụ "level_3" hoặc 3
+-- progress = table bất kỳ, ví dụ { checkpoint=5, score=200, items={...} }
+function GameProgress:Save(player, levelId, progress)
+	local key = string.format("Progress_%s_%s", tostring(player.UserId), tostring(levelId))
+	local payload = {
+		userId    = player.UserId,
+		name      = player.Name,
+		levelId   = levelId,
+		progress  = progress,
+		savedAt   = os.time(),
+		serverId  = SERVER_ID,
+		completed = false,
+	}
+	local ok, err = pcall(function()
+		GameProgressStore:SetAsync(key, payload)
+	end)
+	if ok then
+		print(string.format("[GameProgress] Saved [%s] level=%s", player.Name, tostring(levelId)))
+	else
+		warn(string.format("[GameProgress] Save failed [%s] level=%s — %s",
+			player.Name, tostring(levelId), tostring(err)))
+	end
+	return ok
+end
+
+-- Đọc tiến trình màn chơi
+function GameProgress:Load(player, levelId)
+	local key = string.format("Progress_%s_%s", tostring(player.UserId), tostring(levelId))
+	local ok, data = pcall(function()
+		return GameProgressStore:GetAsync(key)
+	end)
+	if ok and data and not data.completed then
+		return data.progress, data.savedAt
+	end
+	return nil, nil
+end
+
+-- Đánh dấu hoàn thành → xóa progress (không cần lưu nữa)
+function GameProgress:Complete(player, levelId)
+	local key = string.format("Progress_%s_%s", tostring(player.UserId), tostring(levelId))
+	local ok, err = pcall(function()
+		GameProgressStore:RemoveAsync(key)
+	end)
+	if ok then
+		print(string.format("[GameProgress] Completed & cleared [%s] level=%s",
+			player.Name, tostring(levelId)))
+	else
+		warn("[GameProgress] Complete failed — " .. tostring(err))
+	end
+	return ok
+end
+
+-- Kiểm tra player có progress chưa hoàn thành không
+function GameProgress:HasProgress(player, levelId)
+	local prog, _ = GameProgress:Load(player, levelId)
+	return prog ~= nil
+end
+
+-- Lấy danh sách tất cả level đang có progress của player
+-- (dùng ListKeysAsync theo prefix "Progress_<userId>_")
+function GameProgress:GetAllProgress(player)
+	local prefix = string.format("Progress_%s_", tostring(player.UserId))
+	local results = {}
+	local ok, pages = pcall(function()
+		return GameProgressStore:ListKeysAsync(prefix, 100)
+	end)
+	if not ok then return results end
+	local safety = 0
+	while true do
+		safety += 1; if safety > 10 then break end
+		local pok, items = pcall(function() return pages:GetCurrentPage() end)
+		if not pok then break end
+		for _, item in ipairs(items) do
+			-- Parse levelId từ key
+			local levelId = item.KeyName:sub(#prefix + 1)
+			if levelId and levelId ~= "" then
+				local dok, data = pcall(function()
+					return GameProgressStore:GetAsync(item.KeyName)
+				end)
+				if dok and data and not data.completed then
+					results[levelId] = {
+						progress = data.progress,
+						savedAt  = data.savedAt,
+					}
+				end
+			end
+		end
+		if pages.IsFinished then break end
+		pcall(function() pages:AdvanceToNextPageAsync() end)
+	end
+	return results
+end
+
+-- Xóa toàn bộ progress của player (dùng khi reset game hoặc GDPR)
+function GameProgress:WipeAll(player)
+	local prefix = string.format("Progress_%s_", tostring(player.UserId))
+	local ok, pages = pcall(function()
+		return GameProgressStore:ListKeysAsync(prefix, 100)
+	end)
+	if not ok then return end
+	local safety = 0
+	while true do
+		safety += 1; if safety > 10 then break end
+		local pok, items = pcall(function() return pages:GetCurrentPage() end)
+		if not pok then break end
+		for _, item in ipairs(items) do
+			pcall(function() GameProgressStore:RemoveAsync(item.KeyName) end)
+		end
+		if pages.IsFinished then break end
+		pcall(function() pages:AdvanceToNextPageAsync() end)
+	end
+	print("[GameProgress] Wiped all progress for " .. player.Name)
+end
+
+
+
+RF_GetGlobal.OnServerInvoke = function(player, dataType, key)
+	if not checkRateLimit(player,"GetGlobal") then return nil end
+	if GLOBAL_TYPES[dataType] then return GlobalData:Get(dataType, key) end
+	return nil
+end
+
+RF_GetLive.OnServerInvoke = function(player, key)
+	if not checkRateLimit(player,"GetLive") then return nil,nil end
+	return LiveData:Get(key)
+end
+
+RF_GetServerInfo.OnServerInvoke = function(player)
+	if not checkRateLimit(player,"GetServerInfo") then return nil end
+	return { serverId=SERVER_ID, placeId=SERVER_PLACE, startTime=SERVER_START,
+		playerCount=#Players:GetPlayers(), uptime=os.time()-SERVER_START }
+end
+
+RF_GetScheduled.OnServerInvoke = function(player, jobId)
+	if not checkRateLimit(player,"GetScheduled") then return nil end
+	if jobId then return ScheduledData:GetJob(jobId) end
+	local r={}
+	for id,j in pairs(ScheduledData:GetAll()) do
+		r[id]={ jobId=j.jobId, dataType=j.dataType, startTime=j.startTime,
+			endTime=j.endTime, status=j.status, meta=j.meta }
+	end
+	return r
+end
+
+RF_GetRandom.OnServerInvoke = function(player, poolId, overrides)
+	if not checkRateLimit(player,"GetRandom") then return nil end
+	return RandomData:Roll(poolId, overrides)
+end
+
+-- ────────────────────────────────────────────
+--  GetMyData — client lấy data của chính mình
+--  Bỏ qua field visibility = "secret"
+--
+--  Gọi từ client:
+--    local RF = Remotes:WaitForChild("GetMyData")
+--
+--    -- Lấy toàn bộ 1 store:
+--    local data = RF:InvokeServer({ store = "CoursePlayer" })
+--
+--    -- Lấy 1 field (dot-notation):
+--    local coins = RF:InvokeServer({ store = "CoursePlayer", field = "coins" })
+--    local kills = RF:InvokeServer({ store = "CoursePlayer", field = "stats.kills" })
+--
+--    -- Lấy tất cả store cùng lúc:
+--    local all = RF:InvokeServer({})
+-- ────────────────────────────────────────────
+RF_GetMyData.OnServerInvoke = function(player, req)
+	if not checkRateLimit(player, "GetMyData") then return nil end
+	req = req or {}
+
+	-- Lấy tất cả store cùng lúc
+	if not req.store then
+		local result = {}
+		for storeName in pairs(PlayerData._configs) do
+			local cacheKey = tostring(player.UserId) .. "_" .. storeName
+			local entry    = PlayerData._cache[cacheKey]
+			if entry then
+				local schema = PlayerData._schemas[storeName]
+				local meta   = schema and schema.meta or nil
+				result[storeName] = _filterByVisibility(entry.data, meta, true)
+			end
+		end
+		return result
+	end
+
+	-- Lấy 1 store cụ thể
+	local storeName = req.store
+	if not PlayerData._configs[storeName] then
+		warn(string.format("[GetMyData] Store '%s' chưa đăng ký", storeName))
+		return nil
+	end
+
+	local cacheKey = tostring(player.UserId) .. "_" .. storeName
+	local entry    = PlayerData._cache[cacheKey]
+	if not entry then
+		warn(string.format("[GetMyData] %s chưa load xong store '%s'", player.Name, storeName))
+		return nil
+	end
+
+	local schema = PlayerData._schemas[storeName]
+	local meta   = schema and schema.meta or nil
+
+	-- Lấy 1 field cụ thể
+	if req.field then
+		local vis = _getFieldVisibility(meta, req.field)
+		if vis == VISIBILITY_SECRET then
+			warn(string.format("[GetMyData] Field '%s' là secret — không trả về", req.field))
+			return nil
+		end
+		return _getField(entry.data, req.field)
+	end
+
+	-- Lấy toàn bộ store (bỏ secret)
+	return _filterByVisibility(entry.data, meta, true)
+end
+
+-- ────────────────────────────────────────────
+--  GetOtherData — client lấy data player khác
+--  Chỉ trả field visibility = "public"
+--  Target không cần phải online (load từ cache nếu có, DataStore nếu offline)
+--
+--  Gọi từ client:
+--    local RF = Remotes:WaitForChild("GetOtherData")
+--
+--    -- Lấy toàn bộ public data:
+--    local data = RF:InvokeServer({ userId=123456, store="CoursePlayer" })
+--
+--    -- Lấy 1 field public:
+--    local level = RF:InvokeServer({ userId=123456, store="CoursePlayer", field="level" })
+-- ────────────────────────────────────────────
+RF_GetOtherData.OnServerInvoke = function(player, req)
+	if not checkRateLimit(player, "GetOtherData") then return nil end
+	req = req or {}
+
+	if not req.userId or not req.store then
+		warn("[GetOtherData] Thiếu userId hoặc store")
+		return nil
+	end
+
+	-- Không cho lấy data của chính mình qua route này
+	if tostring(req.userId) == tostring(player.UserId) then
+		warn("[GetOtherData] Dùng GetMyData để lấy data của chính mình")
+		return nil
+	end
+
+	local storeName = req.store
+	if not PlayerData._configs[storeName] then return nil end
+
+	local schema = PlayerData._schemas[storeName]
+	local meta   = schema and schema.meta or nil
+
+	-- Lấy từ cache nếu target đang online
+	local cacheKey = tostring(req.userId) .. "_" .. storeName
+	local entry    = PlayerData._cache[cacheKey]
+	local data
+
+	if entry then
+		-- Target online → lấy từ cache
+		data = entry.data
+	else
+		-- Target offline → load từ DataStore (1 lần, không cache lại)
+		local config = PlayerData._configs[storeName]
+		local store  = PlayerData._stores[storeName]
+		if not store then return nil end
+
+		-- Tạo player giả để build key (chỉ cần UserId)
+		local fakePlayer = { UserId = tonumber(req.userId), Name = "" }
+		local key = PlayerData._buildKey(config, fakePlayer)
+		if not key then return nil end
+
+		local ok, raw = pcall(function() return store:GetAsync(key) end)
+		if not ok or not raw then return nil end
+		data = raw.data or raw  -- tương thích cả 2 format
+	end
+
+	if not data then return nil end
+
+	-- Lấy 1 field
+	if req.field then
+		local vis = _getFieldVisibility(meta, req.field)
+		if vis ~= VISIBILITY_PUBLIC then return nil end
+		return _getField(data, req.field)
+	end
+
+	-- Chỉ trả public fields
+	return _filterByVisibility(data, meta, false)
+end
+
+-- ════════════════════════════════════════════
+--  KHỞI ĐỘNG
+-- ════════════════════════════════════════════
+
+task.spawn(function()
+	task.wait(1)
+
+	-- [DataModule] Tạo sẵn các container dùng chung cho GlobalData & SessionData
+	if DataModule then
+		-- Container cho global server state (persist + shared cross-server)
+		DataModule:GetOrCreate("ServerGlobal", {
+			persist  = true,
+			shared   = true,
+			tag      = "global",
+			autoSave = true,
+			interval = 120,
+		})
+		-- Container cho session state (chỉ RAM, reset mỗi server)
+		DataModule:GetOrCreate("ServerSession", {
+			persist = false,
+			shared  = false,
+			tag     = "session",
+		})
+		print("[Data6] DataModule containers khởi tạo xong (ServerGlobal, ServerSession)")
+	end
+
+	-- Đăng ký tất cả store từ PLAYER_STORES inline config
+	for _, entry in ipairs(PLAYER_STORES) do
+		PlayerData._configs[entry.config.storeName] = {
+			storeName     = entry.config.storeName,
+			keyMode       = entry.config.keyMode       or "id",
+			keySeed       = entry.config.keySeed       or "DEFAULT_SEED",
+			allowId       = entry.config.allowId       ~= false,
+			allowName     = entry.config.allowName     ~= false,
+			allowSeed     = entry.config.allowSeed     ~= false,
+			autoSave      = entry.config.autoSave      ~= false,
+			maxHistory    = entry.config.maxHistory    or 20,
+			schemaVersion = entry.config.schemaVersion or 1,
+		}
+		PlayerData._schemas[entry.config.storeName] = entry.schema or { defaults={}, meta={} }
+		local ok, store = pcall(function()
+			return DataStoreService:GetDataStore(entry.config.storeName)
+		end)
+		if ok then
+			PlayerData._stores[entry.config.storeName] = store
+			print(string.format("[Data6] PLAYER_STORES: Đăng ký '%s' | KeyMode=%s",
+				entry.config.storeName, entry.config.keyMode or "id"))
+		else
+			warn(string.format("[Data6] PLAYER_STORES: Không tạo được DataStore '%s'", entry.config.storeName))
+		end
+	end
+
+	-- Scan folder DataStore trong script trước
+	_autoScanScript()
+	-- Sau đó load DataConfig từ Studio
+	DataConfig:Load()
+end)
+
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║  ATTRIBUTOR SYSTEM                                                   ║
+-- ║                                                                      ║
+-- ║  Mirror data từ bất kỳ hệ thống nào ra Instance:SetAttribute()      ║
+-- ║  để script khác (LocalScript / Script) đọc trực tiếp mà không cần  ║
+-- ║  gọi RemoteFunction.                                                 ║
+-- ║                                                                      ║
+-- ║  Hỗ trợ 3 target:                                                    ║
+-- ║    "player"   → player.Character hoặc player (PlayerGui, leaderstats)║
+-- ║    "instance" → bất kỳ Instance nào bạn chỉ định                    ║
+-- ║    "folder"   → tạo/dùng Folder riêng trong ReplicatedStorage       ║
+-- ║                                                                      ║
+-- ║  Sử dụng:                                                            ║
+-- ║    Attributor:Mirror(source, key, value, opts)                       ║
+-- ║    opts = {                                                           ║
+-- ║      target      = "player" | "instance" | "folder",                ║
+-- ║      instance    = Instance,      -- khi target="instance"           ║
+-- ║      folderPath  = "AttrData/...",-- khi target="folder"             ║
+-- ║      player      = player,        -- khi target="player"             ║
+-- ║      attrName    = "customName",  -- tên attribute (default = key)   ║
+-- ║      notifyClient= true,          -- fire RE_DataAttrChanged         ║
+-- ║      serialize   = true,          -- table → JSON string             ║
+-- ║    }                                                                  ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+
+local HttpService = game:GetService("HttpService")
+
+local Attributor = {}
+Attributor._mirrors  = {}   -- { [mirrorId] = { opts, lastValue } }
+Attributor._folders  = {}   -- { [folderPath] = Instance }
+Attributor._counter  = 0
+
+-- ── Helper: encode value → attribute-safe ────────────────────────────────
+-- Roblox attribute chỉ hỗ trợ: string, number, bool, Vector3, Color3, ...
+-- Table cần serialize → JSON string
+local function _encodeAttr(value, serialize)
+	if type(value) == "table" then
+		if serialize == false then
+			warn("[Attributor] value là table nhưng serialize=false — bỏ qua")
+			return nil, false
+		end
+		local ok, json = pcall(HttpService.JSONEncode, HttpService, value)
+		if ok then return json, true end
+		warn("[Attributor] JSONEncode thất bại")
+		return nil, false
+	end
+	if type(value) == "nil" then return nil, true end
+	-- number, string, bool, Vector3, Color3, CFrame, UDim2, UDim, Rect, Vector2
+	return value, true
+end
+
+-- ── Helper: lấy hoặc tạo Folder theo path ────────────────────────────────
+-- path: "MyData" hoặc "MyData/Player/Stats"
+local function _getOrCreateFolder(path)
+	if Attributor._folders[path] then
+		-- Kiểm tra còn tồn tại không
+		if Attributor._folders[path].Parent then
+			return Attributor._folders[path]
+		end
+	end
+	local parts = string.split(path, "/")
+	local cur   = ReplicatedStorage
+	for _, part in ipairs(parts) do
+		local found = cur:FindFirstChild(part)
+		if not found then
+			found = Instance.new("Folder")
+			found.Name   = part
+			found.Parent = cur
+		end
+		cur = found
+	end
+	Attributor._folders[path] = cur
+	return cur
+end
+
+-- ── Helper: resolve instance từ opts ─────────────────────────────────────
+local function _resolveTarget(opts)
+	local target = opts.target or "instance"
+
+	if target == "player" then
+		local p = opts.player
+		if not p or not p.Parent then return nil end
+		-- Ưu tiên Character, fallback về player object
+		return p.Character or p
+
+	elseif target == "folder" then
+		local fp = opts.folderPath or "AttributorData"
+		return _getOrCreateFolder(fp)
+
+	elseif target == "instance" then
+		local inst = opts.instance
+		if not inst or not inst.Parent then return nil end
+		return inst
+	end
+
+	return nil
+end
+
+-- ── Core: ghi attribute ra instance ──────────────────────────────────────
+function Attributor:Mirror(source, key, value, opts)
+	opts = opts or {}
+	local attrName  = opts.attrName or key
+	local inst      = _resolveTarget(opts)
+	if not inst then
+		warn(string.format("[Attributor] Không resolve được target cho key '%s' source='%s'",
+			tostring(key), tostring(source)))
+		return nil
+	end
+
+	local encoded, ok = _encodeAttr(value, opts.serialize)
+	if not ok then return nil end
+
+	-- Ghi attribute
+	local writeOk, writeErr = pcall(function()
+		if encoded == nil then
+			-- Xoá attribute nếu value là nil
+			inst:SetAttribute(attrName, nil)
+		else
+			inst:SetAttribute(attrName, encoded)
+		end
+	end)
+	if not writeOk then
+		warn(string.format("[Attributor] SetAttribute thất bại — %s: %s",
+			attrName, tostring(writeErr)))
+		return nil
+	end
+
+	-- Tạo mirrorId để tracking
+	self._counter += 1
+	local mirrorId = "attr_" .. tostring(self._counter)
+	self._mirrors[mirrorId] = {
+		source    = source,
+		key       = key,
+		attrName  = attrName,
+		lastValue = value,
+		opts      = opts,
+		updatedAt = os.time(),
+	}
+
+	-- Notify client nếu yêu cầu
+	if opts.notifyClient ~= false then
+		pcall(function()
+			local targetPlayer = opts.player
+			if targetPlayer then
+				RE_DataAttrChanged:FireClient(targetPlayer, {
+					source   = source,
+					key      = key,
+					attrName = attrName,
+					value    = value,
+					instPath = inst:GetFullName(),
+				})
+			else
+				for _, p in Players:GetPlayers() do
+					RE_DataAttrChanged:FireClient(p, {
+						source   = source,
+						key      = key,
+						attrName = attrName,
+						value    = value,
+						instPath = inst:GetFullName(),
+					})
+				end
+			end
+		end)
+	end
+
+	return mirrorId
+end
+
+-- ── Xoá attribute ra khỏi instance ───────────────────────────────────────
+function Attributor:Clear(mirrorId)
+	local m = self._mirrors[mirrorId]
+	if not m then return false end
+	local inst = _resolveTarget(m.opts)
+	if inst then
+		pcall(function() inst:SetAttribute(m.attrName, nil) end)
+	end
+	self._mirrors[mirrorId] = nil
+	return true
+end
+
+-- ── Đọc lại attribute từ instance (cho debug) ────────────────────────────
+function Attributor:Read(mirrorId)
+	local m = self._mirrors[mirrorId]
+	if not m then return nil end
+	local inst = _resolveTarget(m.opts)
+	if not inst then return nil end
+	local raw = inst:GetAttribute(m.attrName)
+	-- Nếu là JSON string thì decode
+	if type(raw) == "string" and raw:sub(1,1) == "{" or
+		(type(raw) == "string" and raw:sub(1,1) == "[") then
+		local ok, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
+		if ok then return decoded end
+	end
+	return raw
+end
+
+-- ── Cập nhật value và ghi lại attribute ──────────────────────────────────
+function Attributor:Update(mirrorId, newValue)
+	local m = self._mirrors[mirrorId]
+	if not m then return false end
+	m.lastValue = newValue
+	m.updatedAt = os.time()
+	return self:Mirror(m.source, m.key, newValue, m.opts) ~= nil
+end
+
+-- ── Mirror toàn bộ table data vào Folder dưới dạng nhiều attribute ───────
+-- Mỗi key trong data trở thành 1 attribute trên folder
+-- Hỗ trợ flat (1 cấp) hoặc đệ quy (nested → prefix "parent.child")
+function Attributor:MirrorTable(source, data, opts, prefix)
+	if type(data) ~= "table" then return end
+	prefix = prefix or ""
+	for k, v in pairs(data) do
+		local attrKey = prefix ~= "" and (prefix .. "." .. tostring(k)) or tostring(k)
+		local childOpts = table.clone(opts)
+		childOpts.attrName = attrKey
+
+		if type(v) == "table" and opts.recursive ~= false then
+			-- Đệ quy cho sub-table
+			self:MirrorTable(source, v, opts, attrKey)
+		else
+			self:Mirror(source, attrKey, v, childOpts)
+		end
+	end
+end
+
+-- ── Auto-mirror PlayerData khi Set ───────────────────────────────────────
+-- Đăng ký: khi một storeName được load xong, tự mirror toàn bộ data lên
+-- player.Character attribute.
+-- config = { target, folderPath, recursive, notifyClient, fields }
+-- fields: list field cần mirror (nil = tất cả)
+Attributor._playerMirrorConfigs = {}  -- { [storeName] = config }
+
+function Attributor:RegisterPlayerMirror(storeName, config)
+	self._playerMirrorConfigs[storeName] = config or {}
+	print(string.format("[Attributor] Registered player mirror cho store '%s'", storeName))
+end
+
+-- Gọi sau khi PlayerData:Load() xong để mirror data lên instance
+function Attributor:SyncPlayer(player, storeName, data)
+	local config = self._playerMirrorConfigs[storeName]
+	if not config then return end
+
+	local fields = config.fields  -- nil = mirror tất cả
+	local opts   = {
+		target       = config.target       or "player",
+		player       = player,
+		folderPath   = config.folderPath,
+		instance     = config.instance,
+		recursive    = config.recursive    ~= false,
+		notifyClient = config.notifyClient ~= false,
+		serialize    = config.serialize    ~= false,
+	}
+
+	if fields then
+		for _, fieldPath in ipairs(fields) do
+			-- Lấy value theo dot-notation
+			local parts = fieldPath:split(".")
+			local cur   = data
+			for _, p in ipairs(parts) do
+				if type(cur) ~= "table" then cur = nil; break end
+				cur = cur[p]
+			end
+			if cur ~= nil then
+				local childOpts = table.clone(opts)
+				childOpts.attrName = fieldPath:gsub("%.", "_")  -- dot → underscore cho attr name
+				self:Mirror(storeName, fieldPath, cur, childOpts)
+			end
+		end
+	else
+		-- Mirror tất cả (flat hoặc recursive tùy config)
+		self:MirrorTable(storeName, data, opts)
+	end
+end
+
+-- ── Auto-mirror khi PlayerData:Set() được gọi ────────────────────────────
+-- Được patch vào cuối hàm PlayerData:Set()
+local _origPlayerDataSet = PlayerData.Set
+function PlayerData:Set(player, storeName, fieldPath, value)
+	local result = _origPlayerDataSet(self, player, storeName, fieldPath, value)
+	if result then
+		local config = Attributor._playerMirrorConfigs[storeName]
+		if config then
+			-- Kiểm tra field này có trong danh sách mirror không
+			local fields = config.fields
+			local shouldMirror = (fields == nil)
+			if fields then
+				for _, f in ipairs(fields) do
+					if f == fieldPath then shouldMirror = true; break end
+				end
+			end
+			if shouldMirror then
+				local attrName = fieldPath:gsub("%.", "_")
+				local opts = {
+					target       = config.target       or "player",
+					player       = player,
+					folderPath   = config.folderPath,
+					instance     = config.instance,
+					attrName     = attrName,
+					recursive    = false,   -- Set single field → không cần recursive
+					notifyClient = config.notifyClient ~= false,
+					serialize    = config.serialize    ~= false,
+				}
+				Attributor:Mirror(storeName, fieldPath, value, opts)
+			end
+		end
+	end
+	return result
+end
+
+-- ── Auto-mirror khi PlayerData:Load() xong ───────────────────────────────
+local _origPlayerDataLoad = PlayerData.Load
+function PlayerData:Load(player, storeName)
+	local data = _origPlayerDataLoad(self, player, storeName)
+	if data then
+		-- Sync attribute sau khi load (frame sau để tránh character chưa spawn)
+		task.defer(function()
+			Attributor:SyncPlayer(player, storeName, data)
+		end)
+	end
+	return data
+end
+
+-- ── Sync lại khi Character respawn ───────────────────────────────────────
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		task.wait(0.1)  -- Chờ character settle
+		for storeName, config in pairs(Attributor._playerMirrorConfigs) do
+			if config.target == "player" or config.target == nil then
+				local uid      = tostring(player.UserId)
+				local cacheKey = uid .. "_" .. storeName
+				local cached   = PlayerData._cache[cacheKey]
+				if cached and cached.data then
+					Attributor:SyncPlayer(player, storeName, cached.data)
+				end
+			end
+		end
+	end)
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  TTL CORE ENGINE
+--  Engine trung tâm quản lý expiry cho mọi hệ thống.
+--  (TTLCore đã được forward declare ở trên — ở đây chỉ thêm _entries và methods)
+-- ══════════════════════════════════════════════════════════════════════════
+
+TTLCore._entries = {}
+TTLCore._counter = 0
+
+function TTLCore:Register(opts)
+	self._counter += 1
+	local handle = "ttl_" .. tostring(self._counter)
+	self._entries[handle] = {
+		expireAt     = opts.expireAt,
+		resetMode    = opts.resetMode    or "delete",
+		default      = opts.default,
+		onExpire     = opts.onExpire,
+		notifyClient = opts.notifyClient ~= false,
+		source       = opts.source       or "unknown",
+		label        = opts.label        or handle,
+		_getValue    = opts._getValue,
+		_setValue    = opts._setValue,
+	}
+	return handle
+end
+
+function TTLCore:Extend(handle, newExpireAt)
+	local e = self._entries[handle]
+	if e then e.expireAt = newExpireAt end
+end
+
+function TTLCore:Cancel(handle)
+	self._entries[handle] = nil
+end
+
+local function _expireEntry(handle, entry)
+	local oldValue = entry._getValue and entry._getValue() or nil
+	if entry._setValue then
+		if entry.resetMode == "default" then
+			entry._setValue(entry.default)
+		else
+			entry._setValue(nil)
+		end
+	end
+	if entry.onExpire then
+		task.spawn(entry.onExpire, entry.label, oldValue)
+	end
+	if entry.notifyClient then
+		pcall(function()
+			for _, p in Players:GetPlayers() do
+				RE_DataExpired:FireClient(p, {
+					source    = entry.source,
+					label     = entry.label,
+					resetMode = entry.resetMode,
+					expiredAt = os.time(),
+				})
+			end
+		end)
+	end
+	print(string.format("[TTLCore] EXPIRED [%s] source=%s mode=%s",
+		entry.label, entry.source, entry.resetMode))
+	TTLCore._entries[handle] = nil
+end
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		local now     = os.time()
+		local toCheck = {}
+		for h, e in pairs(TTLCore._entries) do
+			table.insert(toCheck, { h=h, e=e })
+		end
+		for _, item in ipairs(toCheck) do
+			if item.e.expireAt and now >= item.e.expireAt then
+				_expireEntry(item.h, item.e)
+			end
+		end
+	end
+end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  AUTO-RESET DATA
+--  Data độc lập với 4 kiểu reset: restart / ttl_create / ttl_access / schedule
+-- ══════════════════════════════════════════════════════════════════════════
+
+local AutoResetData = {}
+AutoResetData._store       = {}
+AutoResetData._restartKeys = {}
+
+-- Helper: tính expireAt tiếp theo cho schedule
+local function _nextScheduleTime(schedule)
+	local now = os.time()
+	local t   = os.date("*t", now)
+
+	if schedule == "daily" or (type(schedule) == "table" and not schedule.weekday) then
+		local targetHour = (type(schedule) == "table" and schedule.hour)   or 0
+		local targetMin  = (type(schedule) == "table" and schedule.minute) or 0
+		local todayTs    = os.time({ year=t.year, month=t.month, day=t.day,
+			hour=targetHour, min=targetMin, sec=0 })
+		return todayTs > now and todayTs or todayTs + 86400
+
+	elseif schedule == "weekly" or (type(schedule) == "table" and schedule.weekday) then
+		local targetWday = (type(schedule) == "table" and schedule.weekday) or 2
+		local targetHour = (type(schedule) == "table" and schedule.hour)   or 0
+		local targetMin  = (type(schedule) == "table" and schedule.minute) or 0
+		local daysAhead  = (targetWday - t.wday) % 7
+		if daysAhead == 0 then
+			local todayTs = os.time({ year=t.year, month=t.month, day=t.day,
+				hour=targetHour, min=targetMin, sec=0 })
+			if todayTs <= now then daysAhead = 7 end
+		end
+		return now + daysAhead * 86400
+		- (t.hour * 3600 + t.min * 60 + t.sec)
+			+ targetHour * 3600 + targetMin * 60
+
+	elseif type(schedule) == "number" then
+		return schedule
+	end
+	return now + 86400
+end
+
+function AutoResetData:Set(key, value, config)
+	config = config or {}
+	local mode      = config.mode      or "restart"
+	local resetMode = config.resetMode or "delete"
+	local default   = config.default
+
+	local existing = self._store[key]
+	if existing and existing.ttlHandle then TTLCore:Cancel(existing.ttlHandle) end
+
+	local entry = { value=value, config=config, setAt=os.time(), ttlHandle=nil }
+	self._store[key] = entry
+
+	if mode == "restart" then
+		self._restartKeys[key] = true
+
+	elseif mode == "ttl_create" then
+		local ttl = config.ttl or 3600
+		entry.ttlHandle = TTLCore:Register({
+			expireAt     = os.time() + ttl,
+			resetMode    = resetMode,
+			default      = default,
+			onExpire     = config.onExpire,
+			notifyClient = config.notifyClient,
+			source       = "AutoReset",
+			label        = key,
+			_getValue    = function() return self._store[key] and self._store[key].value end,
+			_setValue    = function(v)
+				if v == nil then self._store[key] = nil
+				else self._store[key] = { value=v, config=config, setAt=os.time() } end
+			end,
+		})
+
+	elseif mode == "ttl_access" then
+		local ttl = config.ttl or 3600
+		entry.ttl = ttl
+		entry.ttlHandle = TTLCore:Register({
+			expireAt     = os.time() + ttl,
+			resetMode    = resetMode,
+			default      = default,
+			onExpire     = config.onExpire,
+			notifyClient = config.notifyClient,
+			source       = "AutoReset",
+			label        = key,
+			_getValue    = function() return self._store[key] and self._store[key].value end,
+			_setValue    = function(v)
+				if v == nil then self._store[key] = nil
+				else self._store[key] = { value=v, config=config, setAt=os.time() } end
+			end,
+		})
+
+	elseif mode == "schedule" then
+		local expireAt = _nextScheduleTime(config.schedule or "daily")
+		entry.ttlHandle = TTLCore:Register({
+			expireAt     = expireAt,
+			resetMode    = resetMode,
+			default      = default,
+			onExpire     = function(k, old)
+				if self._store[k] or resetMode == "default" then
+					self:Set(k, default, config)
+				end
+				if config.onExpire then task.spawn(config.onExpire, k, old) end
+			end,
+			notifyClient = config.notifyClient,
+			source       = "AutoReset",
+			label        = key,
+			_getValue    = function() return self._store[key] and self._store[key].value end,
+			_setValue    = function(v)
+				if self._store[key] then self._store[key].value = v end
+			end,
+		})
+	end
+
+	return key
+end
+
+function AutoResetData:Get(key)
+	local e = self._store[key]; return e and e.value or nil
+end
+
+function AutoResetData:Update(key, value)
+	local entry = self._store[key]
+	if not entry then warn("[AutoResetData] key không tồn tại: " .. tostring(key)); return false end
+	entry.value = value
+	entry.setAt = os.time()
+	if entry.config and entry.config.mode == "ttl_access" and entry.ttlHandle and entry.ttl then
+		TTLCore:Extend(entry.ttlHandle, os.time() + entry.ttl)
+	end
+	return true
+end
+
+function AutoResetData:Delete(key)
+	local e = self._store[key]
+	if not e then return false end
+	if e.ttlHandle then TTLCore:Cancel(e.ttlHandle) end
+	self._store[key] = nil
+	self._restartKeys[key] = nil
+	return true
+end
+
+function AutoResetData:GetAll()
+	local r = {}
+	for k, e in pairs(self._store) do r[k] = e.value end
+	return r
+end
+
+function AutoResetData:GetInfo(key)
+	local e = self._store[key]
+	if not e then return nil end
+	local ttlEntry = e.ttlHandle and TTLCore._entries[e.ttlHandle]
+	return {
+		value     = e.value,
+		mode      = e.config and e.config.mode or "restart",
+		setAt     = e.setAt,
+		expireAt  = ttlEntry and ttlEntry.expireAt  or nil,
+		timeLeft  = ttlEntry and ttlEntry.expireAt and math.max(0, ttlEntry.expireAt - os.time()) or nil,
+		resetMode = e.config and e.config.resetMode or "delete",
+	}
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  TTL PATCH — LiveData
+-- ══════════════════════════════════════════════════════════════════════════
+
+function LiveData:SetEx(key, value, ttl, opts)
+	opts = opts or {}
+	ttl  = ttl or 300
+	self:Set(key, value, ttl)
+	TTLCore:Register({
+		expireAt     = os.time() + ttl,
+		resetMode    = opts.resetMode    or "delete",
+		default      = opts.default,
+		onExpire     = opts.onExpire,
+		notifyClient = opts.notifyClient ~= false,
+		source       = "LiveData",
+		label        = key,
+		_getValue    = function() return (LiveData:Get(key)) end,
+		_setValue    = nil,
+	})
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  TTL PATCH — GlobalData
+-- ══════════════════════════════════════════════════════════════════════════
+
+GlobalData._ttlHandles = {}
+
+function GlobalData:SetWithTTL(dataType, key, value, ttl, opts)
+	opts = opts or {}; ttl = ttl or 3600
+	local ok = self:Set(dataType, key, value)
+	if not ok then return false end
+	local fullKey = dataType .. "_" .. key
+	if self._ttlHandles[fullKey] then TTLCore:Cancel(self._ttlHandles[fullKey]) end
+	local handle = TTLCore:Register({
+		expireAt     = os.time() + ttl,
+		resetMode    = opts.resetMode    or "delete",
+		default      = opts.default,
+		onExpire     = opts.onExpire,
+		notifyClient = opts.notifyClient ~= false,
+		source       = "GlobalData",
+		label        = fullKey,
+		_getValue    = function() return GlobalData:Get(dataType, key) end,
+		_setValue    = function(v)
+			if v == nil then
+				GlobalData._cache[fullKey] = nil
+				pcall(function() MemoryGlobal:RemoveAsync(fullKey) end)
+			else
+				GlobalData:Set(dataType, key, v)
+			end
+			GlobalData._ttlHandles[fullKey] = nil
+		end,
+	})
+	self._ttlHandles[fullKey] = handle
+	return handle
+end
+
+function GlobalData:GetTTL(dataType, key)
+	local handle = self._ttlHandles[dataType .. "_" .. key]
+	if not handle then return nil end
+	local e = TTLCore._entries[handle]
+	return e and math.max(0, e.expireAt - os.time()) or nil
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+--  TTL PATCH — PlayerData
+-- ══════════════════════════════════════════════════════════════════════════
+
+-- PlayerData._ttlHandles đã được forward declare ở trên cùng — không cần reset lại ở đây
+
+local function _setFieldPath(data, fieldPath, value)
+	local parts = fieldPath:split(".")
+	local cur   = data
+	for i = 1, #parts - 1 do
+		local p = parts[i]
+		if type(cur[p]) ~= "table" then cur[p] = {} end
+		cur = cur[p]
+	end
+	cur[parts[#parts]] = value
+end
+
+function PlayerData:SetWithTTL(player, storeName, fieldPath, value, ttl, opts)
+	opts = opts or {}; ttl = ttl or 3600
+	local ok = self:Set(player, storeName, fieldPath, value)
+	if not ok then return false end
+
+	local uid        = tostring(player.UserId)
+	local cacheId    = uid .. "_" .. storeName
+	local handle_key = uid .. "_" .. storeName .. "_" .. fieldPath
+
+	if self._ttlHandles[handle_key] then TTLCore:Cancel(self._ttlHandles[handle_key]) end
+
+	local schema  = self._schemas[storeName]
+	local default = opts.default
+	if default == nil and schema then
+		local parts = fieldPath:split(".")
+		local cur   = schema.defaults
+		for _, p in ipairs(parts) do
+			if type(cur) ~= "table" then cur = nil; break end
+			cur = cur[p]
+		end
+		default = cur
+	end
+
+	local handle = TTLCore:Register({
+		expireAt     = os.time() + ttl,
+		resetMode    = opts.resetMode or "default",
+		default      = default,
+		onExpire     = opts.onExpire,
+		notifyClient = opts.notifyClient ~= false,
+		source       = "PlayerData",
+		label        = storeName .. "." .. fieldPath .. "@" .. player.Name,
+		_getValue    = function() return self:Get(player, storeName, fieldPath) end,
+		_setValue    = function(v)
+			local cached = self._cache[cacheId]
+			if not cached then return end
+			_setFieldPath(cached.data, fieldPath, v)
+			self._dirty[cacheId] = true
+			self._ttlHandles[handle_key] = nil
+			-- Sync attribute nếu có mirror
+			local config = Attributor._playerMirrorConfigs[storeName]
+			if config then
+				local attrName = fieldPath:gsub("%.", "_")
+				Attributor:Mirror(storeName, fieldPath, v, {
+					target       = config.target or "player",
+					player       = player,
+					folderPath   = config.folderPath,
+					attrName     = attrName,
+					notifyClient = config.notifyClient ~= false,
+					serialize    = config.serialize    ~= false,
+				})
+			end
+		end,
+	})
+	self._ttlHandles[handle_key] = handle
+	return handle
+end
+
+function PlayerData:GetFieldTTL(player, storeName, fieldPath)
+	local handle_key = tostring(player.UserId) .. "_" .. storeName .. "_" .. fieldPath
+	local handle     = self._ttlHandles[handle_key]
+	if not handle then return nil end
+	local e = TTLCore._entries[handle]
+	return e and math.max(0, e.expireAt - os.time()) or nil
+end
+
+function PlayerData:CancelFieldTTL(player, storeName, fieldPath)
+	local handle_key = tostring(player.UserId) .. "_" .. storeName .. "_" .. fieldPath
+	local handle     = self._ttlHandles[handle_key]
+	if handle then TTLCore:Cancel(handle); self._ttlHandles[handle_key] = nil; return true end
+	return false
+end
+
+-- ════════════════════════════════════════════
+--         PUBLIC API
+-- ════════════════════════════════════════════
+
+local API = {}
+
+-- Session
+function API.Session(key, value)
+	if value ~= nil then SessionData:Set(key, value)
+	else return SessionData:Get(key) end
+end
+function API.Log(t, d)      SessionData:Log(t, d) end
+function API.GetEventLog()  return SessionData._events end
+
+-- Live
+function API.SetLive(k,v,t)    LiveData:Set(k,v,t) end
+function API.GetLive(k)         return LiveData:Get(k) end
+function API.UpdateLive(k,f,t)  LiveData:Update(k,f,t) end
+function API.DeleteLive(k)      LiveData:Delete(k) end
+
+-- Global
+function API.SetGlobal(dt,k,v)   return GlobalData:Set(dt,k,v) end
+function API.GetGlobal(dt,k)      return GlobalData:Get(dt,k) end
+function API.IncrementGlobal(k,a) GlobalData:Increment(k,a) end
+function API.AdminBroadcast(m,d)  GlobalData:AdminBroadcast(m,d) end
+
+-- Conflict
+function API.GetConflict(player)
+	return SessionData:Get("conflict_"..player.UserId)
+end
+
+-- Server
+function API.GetServerInfo()
+	return { serverId=SERVER_ID, placeId=SERVER_PLACE,
+		startTime=SERVER_START, uptime=os.time()-SERVER_START,
+		playerCount=#Players:GetPlayers() }
+end
+function API.GetActiveServers()
+	local servers = {}
+	local ok, pages = pcall(function()
+		return MemorySession:GetRangeAsync(Enum.SortDirection.Ascending, 20)
+	end)
+	if ok and pages then
+		for _, e in ipairs(pages) do
+			local v = e.value
+			if e.key:sub(1,7)=="Server_" and v and v.lastPing
+				and (os.time()-v.lastPing)<90 then
+				table.insert(servers, v)
+			end
+		end
+	end
+	return servers
+end
+
+-- Scheduled
+function API.ScheduleData(id,dt,payload,st,et,meta) return ScheduledData:Register(id,dt,payload,st,et,meta) end
+function API.CancelScheduled(id)                    return ScheduledData:Cancel(id) end
+function API.UpdateScheduled(id,payload)            return ScheduledData:UpdateActive(id,payload) end
+function API.GetScheduledJob(id)                    return ScheduledData:GetJob(id) end
+function API.GetAllScheduled(fs)                    return ScheduledData:GetAll(fs) end
+function API.OnScheduledFired(id,cb)                ScheduledData:OnFired(id,cb) end
+
+-- Random
+function API.RegisterPool(poolId, config)           RandomData:RegisterPool(poolId, config) end
+function API.Roll(poolId, overrides)                return RandomData:Roll(poolId, overrides) end
+function API.RandomList(items)                      return RandomData:FromList(items) end
+function API.RandomRange(min, max, isFloat)         return RandomData:InRange(min, max, isFloat) end
+function API.RandomWeighted(items)                  return RandomData:Weighted(items) end
+function API.RandomWeightedMulti(items, n)          return RandomData:WeightedMulti(items, n) end
+function API.RandomSeeded(seed, mode, args)         return RandomData:Seeded(seed, mode, args) end
+function API.RandomBonus(config)                    return RandomData:BonusStack(config) end
+
+-- GameEventLog
+function API.PushEvent(player, eventType, data)            GameEventLog:Push(player, eventType, data) end
+function API.UpdateSnapshot(player, pos, cp, custom)       GameEventLog:UpdateSnapshot(player, pos, cp, custom) end
+function API.GetSnapshot(player)                           return GameEventLog:GetSnapshot(player) end
+function API.ClearSnapshot(player)                         GameEventLog:ClearSnapshot(player) end
+function API.GetGameSession(player)                        return GameEventLog:GetSession(player) end
+function API.GetSessionTime(player)                        return GameEventLog:GetSessionTime(player) end
+
+-- TimeUtil
+function API.ToTimestamp(y,m,d,h,mi,s) return TimeUtil.toTimestamp(y,m,d,h,mi,s) end
+function API.FormatTime(ts)             return TimeUtil.format(ts) end
+function API.BreakdownTime(ts)          return TimeUtil.breakdown(ts) end
+
+-- DataConfig
+function API.ReloadConfig() DataConfig:Reload() end
+
+-- ══════════════════════════════════════════════
+--  PLAYER DATA API  (phần mới)
+-- ══════════════════════════════════════════════
+
+-- Đăng ký store thủ công (không qua folder)
+-- config = { storeName, keyMode, keySeed, allowId, allowName, allowSeed, autoSave, maxHistory, schemaVersion }
+-- schema = { defaults = {...}, meta = {...} }
+function API.RegisterPlayerStore(config, schema)
+	local storeName = config.storeName
+	PlayerData._configs[storeName] = {
+		storeName     = storeName,
+		keyMode       = config.keyMode       or "id",
+		keySeed       = config.keySeed       or "DEFAULT_SEED",
+		allowId       = config.allowId       ~= false,
+		allowName     = config.allowName     ~= false,
+		allowSeed     = config.allowSeed     ~= false,
+		autoSave      = config.autoSave      ~= false,
+		maxHistory    = config.maxHistory    or 20,
+		schemaVersion = config.schemaVersion or 1,
+		-- Old key migration
+		oldKeyPrefix  = config.oldKeyPrefix  or nil,  -- prefix thay thế storeName: "player", "player_v1"
+		oldStoreName  = config.oldStoreName  or nil,  -- nếu store cũ khác tên
+		oldKeySeed    = config.oldKeySeed    or nil,  -- seed cũ nếu khác seed hiện tại
+	}
+	PlayerData._schemas[storeName] = schema or { defaults={}, meta={} }
+	local ok, store = pcall(function()
+		return DataStoreService:GetDataStore(storeName)
+	end)
+	if ok then
+		PlayerData._stores[storeName] = store
+		print("PlayerData: Registered store — " .. storeName)
+		return true
+	end
+	return false
+end
+
+-- Đăng ký store từ folder (manual)
+function API.RegisterPlayerStoreFromFolder(folder)
+	return PlayerData:RegisterFromFolder(folder)
+end
+
+-- Load / Save
+function API.LoadPlayerData(player, storeName)   return PlayerData:Load(player, storeName) end
+function API.SavePlayerData(player, storeName)   return PlayerData:Save(player, storeName) end
+
+-- Get / Set / Increment / Decrement / Toggle
+-- fieldPath hỗ trợ dot-notation: "stats.kills"
+function API.GetData(player, storeName, fieldPath)          return PlayerData:Get(player, storeName, fieldPath) end
+function API.SetData(player, storeName, fieldPath, value)   return PlayerData:Set(player, storeName, fieldPath, value) end
+function API.IncrementData(player, storeName, field, amt)   return PlayerData:Increment(player, storeName, field, amt) end
+function API.DecrementData(player, storeName, field, amt)   return PlayerData:Decrement(player, storeName, field, amt) end
+function API.ToggleData(player, storeName, fieldPath)       return PlayerData:Toggle(player, storeName, fieldPath) end
+function API.GetAllData(player, storeName)                  return PlayerData:GetAll(player, storeName) end
+
+-- Reset / Wipe
+function API.ResetPlayerData(player, storeName) return PlayerData:Reset(player, storeName) end
+function API.WipePlayerData(player, storeName)  return PlayerData:Wipe(player, storeName) end
+
+-- Lịch sử & version
+function API.GetDataHistory(player, storeName)          return PlayerData:GetHistory(player, storeName) end
+function API.GetDataVersion(player, storeName)          return PlayerData:GetVersion(player, storeName) end
+function API.GetDataAtTime(player, storeName, timestamp) return PlayerData:GetVersionedData(player, storeName, timestamp) end
+
+-- Kiểm tra
+function API.IsDataLoaded(player, storeName)  return PlayerData:IsLoaded(player, storeName) end
+function API.GetCacheInfo(player, storeName)  return PlayerData:GetCacheInfo(player, storeName) end
+
+-- Key utilities
+function API.GetPlayerKey(player, storeName)
+	local config = PlayerData._configs[storeName]
+	if not config then return nil end
+	return PlayerData._buildKey(config, player)
+end
+
+-- ══════════════════════════════════════════════
+--  DATASAVE API  — truy cập trực tiếp DataSave
+--  (data player theo session, đơn giản & nhẹ)
+-- ══════════════════════════════════════════════
+
+-- Đăng ký fields cần lưu (gọi trước khi player join)
+-- API.DSRegisterField("coins", 0)
+-- API.DSRegisterFields({ coins=0, level=1 })
+function API.DSRegisterField(field, default)
+	if not DataSave then warn("[Data6] DataSave chưa được load"); return end
+	DataSave:RegisterField(field, default)
+end
+function API.DSRegisterFields(fields)
+	if not DataSave then warn("[Data6] DataSave chưa được load"); return end
+	DataSave:RegisterFields(fields)
+end
+
+-- Đọc / ghi data player qua DataSave
+function API.DSGet(player, field)            if DataSave then return DataSave:Get(player, field) end end
+function API.DSSet(player, field, value)     if DataSave then return DataSave:Set(player, field, value) end end
+function API.DSGetAll(player)                if DataSave then return DataSave:GetAll(player) end end
+function API.DSIncrement(player, field, amt) if DataSave then return DataSave:Increment(player, field, amt) end end
+function API.DSDecrement(player, field, amt) if DataSave then return DataSave:Decrement(player, field, amt) end end
+function API.DSToggle(player, field)         if DataSave then return DataSave:Toggle(player, field) end end
+function API.DSUpdateTable(player, field, fn)if DataSave then return DataSave:UpdateTable(player, field, fn) end end
+function API.DSReset(player, field)          if DataSave then return DataSave:Reset(player, field) end end
+function API.DSSave(player)                  if DataSave then return DataSave:Save(player) end end
+function API.DSWipe(player)                  if DataSave then return DataSave:Wipe(player) end end
+function API.DSWaitForLoad(player, timeout)  if DataSave then return DataSave:WaitForLoad(player, timeout) end end
+function API.DSIsLoaded(player)              if DataSave then return DataSave:IsLoaded(player) end end
+function API.DSSessionInfo(player)           if DataSave then return DataSave:GetSessionInfo(player) end end
+function API.DSAllSessions()                 if DataSave then return DataSave:GetAllSessions() end end
+
+-- ══════════════════════════════════════════════
+--  DATAMODULE API  — truy cập trực tiếp DataModule
+--  (data container server: shop, event, config…)
+-- ══════════════════════════════════════════════
+
+-- Tạo hoặc lấy container
+-- API.DMCreate("ShopPrices", { persist=true, shared=true, tag="shop" })
+function API.DMCreate(id, setting)
+	if not DataModule then return end
+	setting = setting or {}
+	-- Tự động wrap onChange để fire RE_DataModuleChanged tới client
+	setting.onChange = _wrapOnChange(id, setting.onChange)
+	return DataModule:Create(id, setting)
+end
+function API.DMGetOrCreate(id, s)
+	if not DataModule then return end
+	if DataModule:Get(id) then return DataModule:Get(id) end
+	return API.DMCreate(id, s)
+end
+function API.DMGet(id)                if DataModule then return DataModule:Get(id) end end
+function API.DMList()                 if DataModule then return DataModule:List() end end
+function API.DMDestroy(id)            if DataModule then return DataModule:Destroy(id) end end
+function API.DMSaveAll()              if DataModule then return DataModule:SaveAll() end end
+
+-- Truy cập trực tiếp vào container (shortcut)
+-- API.DMSet("ShopPrices", "sword", 150)
+function API.DMSet(id, key, value)
+	if not DataModule then return false end
+	local obj = DataModule:Get(id)
+	if not obj then warn("[Data6] DataModule container '" .. id .. "' chưa tồn tại"); return false end
+	return obj:Set(key, value)
+end
+function API.DMGetVal(id, key)
+	if not DataModule then return nil end
+	local obj = DataModule:Get(id)
+	return obj and obj:Get(key) or nil
+end
+function API.DMIncrement(id, key, amt)
+	if not DataModule then return false end
+	local obj = DataModule:Get(id)
+	return obj and obj:Increment(key, amt) or false
+end
+function API.DMGetAll(id)
+	if not DataModule then return nil end
+	local obj = DataModule:Get(id)
+	return obj and obj:GetAll() or nil
+end
+
+-- Expose module thô (nếu muốn dùng trực tiếp)
+API._DataSave   = DataSave
+API._DataModule = DataModule
+
+-- ══════════════════════════════════════════════
+--  ATTRIBUTOR API
+-- ══════════════════════════════════════════════
+
+-- Mirror một giá trị ra Instance:SetAttribute()
+-- Trả về mirrorId để update/clear sau này
+--
+-- API.AttrMirror("MySource", "coins", 500, {
+--   target       = "player",         -- "player" | "instance" | "folder"
+--   player       = player,           -- khi target="player"
+--   folderPath   = "AttrData/Stats", -- khi target="folder" (tạo tự động trong ReplicatedStorage)
+--   instance     = someInstance,     -- khi target="instance"
+--   attrName     = "Coins",          -- tên attribute (mặc định = key)
+--   notifyClient = true,             -- fire RE_DataAttrChanged tới client
+--   serialize    = true,             -- table → JSON string
+-- })
+function API.AttrMirror(source, key, value, opts)
+	return Attributor:Mirror(source, key, value, opts)
+end
+
+-- Cập nhật attribute đã mirror (theo mirrorId)
+function API.AttrUpdate(mirrorId, newValue)
+	return Attributor:Update(mirrorId, newValue)
+end
+
+-- Xoá attribute khỏi instance và dừng tracking
+function API.AttrClear(mirrorId)
+	return Attributor:Clear(mirrorId)
+end
+
+-- Đọc lại giá trị attribute từ instance (decode JSON nếu là table)
+function API.AttrRead(mirrorId)
+	return Attributor:Read(mirrorId)
+end
+
+-- Mirror toàn bộ table ra folder/instance dưới dạng nhiều attribute
+-- API.AttrMirrorTable("ShopData", { sword=150, shield=200 }, {
+--   target     = "folder",
+--   folderPath = "AttrData/Shop",
+--   recursive  = true,    -- xử lý sub-table (mặc định = true)
+-- })
+function API.AttrMirrorTable(source, data, opts)
+	Attributor:MirrorTable(source, data, opts)
+end
+
+-- Đăng ký tự động mirror PlayerData lên attribute mỗi khi Set()
+-- Sau khi đăng ký, mọi PlayerData:Set() cho storeName này sẽ tự mirror.
+--
+-- API.AttrRegisterPlayerMirror("PlayerStore", {
+--   target       = "player",           -- ghi lên player.Character (hoặc player)
+--   fields       = { "coins", "level", "stats.kills" },  -- nil = mirror tất cả
+--   recursive    = true,
+--   notifyClient = true,
+--   serialize    = true,
+-- })
+function API.AttrRegisterPlayerMirror(storeName, config)
+	Attributor:RegisterPlayerMirror(storeName, config)
+end
+
+-- Sync thủ công toàn bộ data của player lên attribute (dùng sau respawn hoặc load)
+-- API.AttrSyncPlayer(player, "PlayerStore")
+function API.AttrSyncPlayer(player, storeName)
+	local uid      = tostring(player.UserId)
+	local cacheKey = uid .. "_" .. storeName
+	local cached   = PlayerData._cache[cacheKey]
+	if cached and cached.data then
+		Attributor:SyncPlayer(player, storeName, cached.data)
+		return true
+	end
+	return false
+end
+
+-- Expose raw module
+API._Attributor = Attributor
+
+-- ══════════════════════════════════════════════
+--  AUTO-RESET DATA API
+-- ══════════════════════════════════════════════
+
+-- Set data với chế độ auto-reset
+-- mode = "restart"    → mất khi server restart
+-- mode = "ttl_create" → hết hạn sau X giây kể từ lúc tạo
+-- mode = "ttl_access" → hết hạn sau X giây kể từ lần Set/Update cuối
+-- mode = "schedule"   → reset theo lịch (daily/weekly/timestamp)
+--
+-- API.ARSet("dailyQuest", { done=false }, {
+--   mode         = "schedule",
+--   schedule     = "daily",        -- hoặc "weekly" | { weekday=2, hour=6 } | timestamp
+--   resetMode    = "default",      -- "delete" | "default"
+--   default      = { done=false },
+--   notifyClient = true,
+--   onExpire     = function(key, oldValue) end,
+-- })
+function API.ARSet(key, value, config)    return AutoResetData:Set(key, value, config) end
+function API.ARGet(key)                    return AutoResetData:Get(key) end
+function API.ARUpdate(key, value)          return AutoResetData:Update(key, value) end
+function API.ARDelete(key)                 return AutoResetData:Delete(key) end
+function API.ARGetAll()                    return AutoResetData:GetAll() end
+function API.ARGetInfo(key)                return AutoResetData:GetInfo(key) end
+
+-- ══════════════════════════════════════════════
+--  LIVE DATA TTL EX API
+-- ══════════════════════════════════════════════
+
+-- Set LiveData với TTL + callback khi hết hạn
+-- API.SetLiveEx("eventBoss", bossData, 600, {
+--   onExpire     = function(key, old) print("boss despawned") end,
+--   notifyClient = true,
+-- })
+function API.SetLiveEx(key, value, ttl, opts)
+	LiveData:SetEx(key, value, ttl, opts)
+end
+function API.GetLiveTTL(key)
+	for _, e in pairs(TTLCore._entries) do
+		if e.source == "LiveData" and e.label == key then
+			return math.max(0, e.expireAt - os.time())
+		end
+	end
+	return nil
+end
+
+-- ══════════════════════════════════════════════
+--  GLOBAL DATA TTL API
+-- ══════════════════════════════════════════════
+
+-- Set GlobalData hết hạn sau ttl giây
+-- API.SetGlobalWithTTL("eventState", "doubleXP", { active=true }, 7200, {
+--   resetMode    = "default",
+--   default      = { active=false },
+--   notifyClient = true,
+--   onExpire     = function(key, old) end,
+-- })
+function API.SetGlobalWithTTL(dt, key, value, ttl, opts)
+	return GlobalData:SetWithTTL(dt, key, value, ttl, opts)
+end
+function API.GetGlobalTTL(dt, key)
+	return GlobalData:GetTTL(dt, key)
+end
+
+-- ══════════════════════════════════════════════
+--  PLAYER DATA TTL API
+-- ══════════════════════════════════════════════
+
+-- Set một field player với TTL (tự về default khi hết hạn)
+-- API.SetPlayerFieldWithTTL(player, "PlayerStore", "stats.speedBuff", 2.0, 300, {
+--   resetMode    = "default",
+--   notifyClient = true,
+--   onExpire     = function(label, old) end,
+-- })
+function API.SetPlayerFieldWithTTL(player, storeName, fieldPath, value, ttl, opts)
+	return PlayerData:SetWithTTL(player, storeName, fieldPath, value, ttl, opts)
+end
+function API.GetPlayerFieldTTL(player, storeName, fieldPath)
+	return PlayerData:GetFieldTTL(player, storeName, fieldPath)
+end
+function API.CancelPlayerFieldTTL(player, storeName, fieldPath)
+	return PlayerData:CancelFieldTTL(player, storeName, fieldPath)
+end
+
+-- ══════════════════════════════════════════════
+--  TTL CORE UTILS
+-- ══════════════════════════════════════════════
+function API.TTLCancel(handle)  TTLCore:Cancel(handle) end
+function API.TTLGetAll()        return TTLCore._entries end
+
+-- Expose raw modules
+API._AutoResetData = AutoResetData
+API._TTLCore       = TTLCore
+
+-- ══════════════════════════════════════════════
+--  FIELD EXPIRY / RESET API
+-- ══════════════════════════════════════════════
+
+-- Đọc trạng thái hết hạn / reset của 1 field
+-- Trả về: { type, secondsLeft, expireAt, expireAtStr, isExpired,
+--           resetAfterSecs, resetSecondsLeft, willReset }
+-- API.GetFieldExpiryInfo(player, "PlayerStore", "vip")
+function API.GetFieldExpiryInfo(player, storeName, fieldPath)
+	return PlayerData:GetFieldExpiryInfo(player, storeName, fieldPath)
+end
+
+-- Force check ngay tất cả field reset/expire của player (không cần reload)
+-- Trả về true nếu có field nào thay đổi
+-- API.ForceCheckExpiry(player, "PlayerStore")
+function API.ForceCheckExpiry(player, storeName)
+	return PlayerData:ForceCheckExpiry(player, storeName)
+end
+
+-- Util: parse chuỗi ResetAfter → số giây (dùng để test)
+-- API.ParseResetAfter("1d12h30m") → 131400
+function API.ParseResetAfter(raw)
+	return _parseResetAfter(raw)
+end
+
+-- Util: parse chuỗi ExpireAt → Unix timestamp
+-- API.ParseExpireAt("31/12/2030 23:59") → 1924991940
+function API.ParseExpireAt(raw)
+	return _parseExpireAt(raw)
+end
+
+-- ══════════════════════════════════════════════
+--  MIGRATION PROMPT API
+--
+--  Flow:
+--    1. Player join → Load() tìm thấy data cũ VÀ data mới đều có
+--    2. Data cũ được lưu tạm vào _pendingMigration
+--    3. Server gọi GetPendingMigration() để kiểm tra
+--    4. Nếu có → gửi UI hỏi player (qua RemoteEvent của bạn)
+--    5. Khi player chọn → gọi ConfirmMigration(player, storeName, true/false)
+--
+--  Ví dụ sử dụng:
+--    task.delay(3, function()
+--        local pending = SDM.GetPendingMigration(player, "CouserPlayer")
+--        if pending then
+--            -- Fire UI cho client hỏi player
+--            AskMigrationEvent:FireClient(player, storeName)
+--            -- Khi client trả lời:
+--            SDM.ConfirmMigration(player, "CouserPlayer", true)  -- hoặc false
+--        end
+--    end)
+-- ══════════════════════════════════════════════
+
+-- Kiểm tra xem player có data cũ đang chờ xác nhận không
+-- Trả về { oldData, oldKey, oldStore, detectedAt } hoặc nil
+function API.GetPendingMigration(player, storeName)
+	local key = tostring(player.UserId) .. "_" .. storeName
+	return PlayerData._pendingMigration[key]
+end
+
+-- Xác nhận migration
+--   accept = true  → ghi đè data cũ vào cache, đánh dấu dirty để save ngay
+--   accept = false → bỏ data cũ, giữ nguyên data mới
+function API.ConfirmMigration(player, storeName, accept)
+	local uid      = tostring(player.UserId)
+	local pmKey    = uid .. "_" .. storeName
+	local pending  = PlayerData._pendingMigration[pmKey]
+
+	if not pending then
+		warn("ConfirmMigration: Không có migration đang chờ cho " .. player.Name .. " / " .. storeName)
+		return false
+	end
+
+	local cacheKey = uid .. "_" .. storeName
+	local schema   = PlayerData._schemas[storeName]
+
+	if accept then
+		-- Lấy data cũ, migrate field name, điền defaults còn thiếu
+		local oldRaw  = pending.oldData
+		local oldData = type(oldRaw) == "table" and (oldRaw.data or oldRaw) or {}
+
+		_migrateOldData(oldData, schema.meta)
+		_applyDefaults(oldData, schema.defaults)
+
+		-- Ghi đè vào cache hiện tại
+		if PlayerData._cache[cacheKey] then
+			PlayerData._cache[cacheKey].data = oldData
+		end
+
+		-- Đánh dấu dirty để auto-save ghi xuống DataStore
+		PlayerData._dirty[cacheKey] = true
+
+		-- Xóa key cũ nếu nằm ở store khác (tránh double data)
+		if pending.oldStore and pending.oldStore ~= storeName then
+			local sok, oldStore = pcall(function()
+				return DataStoreService:GetDataStore(pending.oldStore)
+			end)
+			if sok then
+				pcall(function() oldStore:RemoveAsync(pending.oldKey) end)
+			end
+		end
+
+		print(string.format("ConfirmMigration: [%s/%s] ACCEPTED — data cũ '%s' đã được áp dụng",
+			player.Name, storeName, pending.oldKey))
+	else
+		print(string.format("ConfirmMigration: [%s/%s] DECLINED — giữ data mới, bỏ data cũ '%s'",
+			player.Name, storeName, pending.oldKey))
+	end
+
+	-- Xóa khỏi bảng chờ dù accept hay không
+	PlayerData._pendingMigration[pmKey] = nil
+	return true
+end
+
+return API
